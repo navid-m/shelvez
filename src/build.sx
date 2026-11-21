@@ -426,7 +426,6 @@ pub fn build(
         if @get(ws.site.pages, i as usize) is some item {
             val html: str.StringView = page.render_page(
                 ws.arena,
-                ws.la,
                 ws.site.cfg,
                 ws.site.nav,
                 ws.site.pages,

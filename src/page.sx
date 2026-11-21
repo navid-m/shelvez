@@ -43,12 +43,6 @@ pub fn home_url(pages: list[ref tree.Page]) str.StringView = trust {
     return "/"
 }
 
-val ICON_HOME: str.StringView = \\<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-\\  <path d="M3 10.7 12 3l9 7.7"/>
-\\  <path d="M5.5 9.5V21h13V9.5"/>
-\\  <path d="M9.5 21v-6h5v6"/>
-\\</svg>
-
 val ICON_SUN: str.StringView = \\<svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
 \\  <circle cx="12" cy="12" r="4"/>
 \\  <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>
@@ -60,11 +54,6 @@ val ICON_MOON: str.StringView = \\<svg class="icon-moon" viewBox="0 0 24 24" fil
 
 val ICON_MENU: str.StringView = \\<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
 \\  <path d="M4 7h16M4 12h16M4 17h16"/>
-\\</svg>
-
-val ICON_SEARCH: str.StringView = \\<svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
-\\  <circle cx="11" cy="11" r="7"/>
-\\  <path d="m20 20-3.5-3.5"/>
 \\</svg>
 
 val HEAD_OPEN: str.StringView = \\<!DOCTYPE html>
@@ -89,20 +78,17 @@ val TOPBAR_OPEN: str.StringView = \\<body>
 
 val TOPBAR_BRAND_OPEN: str.StringView = \\  </button>
 \\  <a class="brand" href="/">
-\\    <span class="brand-mark" aria-hidden="true">S</span>
-\\    <span class="brand-title">
+
+val BRAND_TITLE_OPEN: str.StringView = \\    <span class="brand-title">
 
 val SEARCH_OPEN: str.StringView = \\</span>
 \\  </a>
 \\  <div class="search-wrap">
 
-val SEARCH_CLOSE: str.StringView = \\<input class="search-input" id="search" type="search" placeholder="Search documentation" autocomplete="off" aria-label="Search documentation">
+val SEARCH_CLOSE: str.StringView = \\<input class="search-input" id="search" type="search" placeholder="Search" autocomplete="off" aria-label="Search">
 \\    <div class="search-results" id="search-results"></div>
 \\  </div>
 \\  <div class="top-actions">
-\\    <a class="icon-button" href="/" title="Home" aria-label="Home">
-
-val ACTIONS_MID: str.StringView = \\</a>
 \\    <button class="icon-button" id="theme-toggle" type="button" aria-label="Toggle color theme" aria-pressed="false">
 
 val ACTIONS_END: str.StringView = \\</button>
@@ -112,19 +98,10 @@ val ACTIONS_END: str.StringView = \\</button>
 \\  <aside class="sidebar">
 
 val SIDEBAR_TOC_OPEN: str.StringView = \\    <div class="sidebar-toc">
-\\      <div class="sidebar-label">On this page</div>
 
 val SIDEBAR_TOC_CLOSE: str.StringView = \\    </div>
-\\    <div class="sidebar-rule"></div>
 
-val SIDEBAR_MENU_OPEN: str.StringView = \\    <div class="sidebar-label">Menu</div>
-\\    <a class="nav-home-link" href="/">
-
-val SIDEBAR_MENU_MID: str.StringView = \\      <span>Home</span>
-\\    </a>
-
-val SIDEBAR_MENU_END: str.StringView = \\    <div class="sidebar-footer">Built with Shelvez</div>
-\\  </aside>
+val SIDEBAR_CLOSE: str.StringView = \\  </aside>
 \\  <div class="sidebar-overlay" aria-hidden="true"></div>
 \\  <main class="main" id="main-content">
 \\    <div class="content">
@@ -230,75 +207,6 @@ fn render_nav(
     util.abuf_append(ar, b, "</ul></nav>")
 }
 
-fn collect_crumbs(
-    la: allocators.ListArena,
-    node: ref tree.NavNode
-) option[list[ref tree.NavNode]] = trust {
-    match @listalloc[allocators.ListArena, ref tree.NavNode](la) {
-        ok crumbs => {
-            val chain: mut list[ref tree.NavNode] = crumbs
-            val cursor: mut ref tree.NavNode = node
-            for {
-                if cursor == none {
-                    break
-                }
-                @insert(chain, 0 as usize, cursor)
-                cursor = cursor.parent
-            }
-            return some chain
-        }
-        err _ => {
-            return none
-        }
-    }
-}
-
-fn render_breadcrumbs(
-    ar: allocators.ScopedArenaAllocator,
-    la: allocators.ListArena,
-    b: mut ref util.ABuf,
-    root: ref tree.NavNode,
-    page: ref tree.Page
-) void = trust {
-    if tree.find_node(root, page.url) is some node {
-        if collect_crumbs(la, node) is some crumbs {
-            val n: i64 = @len(crumbs) as i64
-            if n <= 1 {
-                return
-            }
-            util.abuf_append(ar, b, "<div class=\"breadcrumbs\">")
-            val i: mut i64 = 1
-            for {
-                if i >= n {
-                    break
-                }
-                if i > 1 {
-                    util.abuf_append(ar, b, "<span class=\"sep\">/</span>")
-                }
-                if @get(crumbs, i as usize) is some crumb {
-                    if i == n - 1 {
-                        util.abuf_append(ar, b, "<span class=\"current\">")
-                        attr(ar, b, crumb.title)
-                        util.abuf_append(ar, b, "</span>")
-                    } elif crumb.url.len > 0 {
-                        util.abuf_append(ar, b, "<a href=\"")
-                        attr(ar, b, crumb.url)
-                        util.abuf_append(ar, b, "\">")
-                        attr(ar, b, crumb.title)
-                        util.abuf_append(ar, b, "</a>")
-                    } else {
-                        util.abuf_append(ar, b, "<span>")
-                        attr(ar, b, crumb.title)
-                        util.abuf_append(ar, b, "</span>")
-                    }
-                }
-                i++
-            }
-            util.abuf_append(ar, b, "</div>")
-        }
-    }
-}
-
 fn page_index(pages: list[ref tree.Page], url: str.StringView) i64 = trust {
     val n: i64 = @len(pages) as i64
     val i: mut i64 = 0
@@ -338,20 +246,20 @@ fn render_page_nav(
     util.abuf_append(ar, b, "<nav class=\"page-nav\" aria-label=\"Previous and next\">")
     if has_prev {
         if @get(pages, (idx - 1) as usize) is some prev {
-            util.abuf_append(ar, b, "<a class=\"prev\" href=\"")
+            util.abuf_append(ar, b, "<a class=\"prev\" rel=\"prev\" href=\"")
             attr(ar, b, prev.url)
-            util.abuf_append(ar, b, "\"><span class=\"dir\">Previous</span><span class=\"label\">")
+            util.abuf_append(ar, b, "\">&larr; ")
             attr(ar, b, prev.title)
-            util.abuf_append(ar, b, "</span></a>")
+            util.abuf_append(ar, b, "</a>")
         }
     }
     if has_next {
         if @get(pages, (idx + 1) as usize) is some next {
-            util.abuf_append(ar, b, "<a class=\"next\" href=\"")
+            util.abuf_append(ar, b, "<a class=\"next\" rel=\"next\" href=\"")
             attr(ar, b, next.url)
-            util.abuf_append(ar, b, "\"><span class=\"dir\">Next</span><span class=\"label\">")
+            util.abuf_append(ar, b, "\">")
             attr(ar, b, next.title)
-            util.abuf_append(ar, b, "</span></a>")
+            util.abuf_append(ar, b, " &rarr;</a>")
         }
     }
     util.abuf_append(ar, b, "</nav>")
@@ -359,7 +267,6 @@ fn render_page_nav(
 
 pub fn render_page(
     ar: allocators.ScopedArenaAllocator,
-    la: allocators.ListArena,
     cfg: config.Config,
     root: ref tree.NavNode,
     pages: list[ref tree.Page],
@@ -390,12 +297,15 @@ pub fn render_page(
     util.abuf_append(ar, @addr(b), TOPBAR_OPEN)
     util.abuf_append(ar, @addr(b), ICON_MENU)
     util.abuf_append(ar, @addr(b), TOPBAR_BRAND_OPEN)
+    if cfg.icon.len > 0 {
+        util.abuf_append(ar, @addr(b), "    <span class=\"brand-mark\" aria-hidden=\"true\">")
+        attr(ar, @addr(b), cfg.icon)
+        util.abuf_append(ar, @addr(b), "</span>\n")
+    }
+    util.abuf_append(ar, @addr(b), BRAND_TITLE_OPEN)
     attr(ar, @addr(b), cfg.title)
     util.abuf_append(ar, @addr(b), SEARCH_OPEN)
-    util.abuf_append(ar, @addr(b), ICON_SEARCH)
     util.abuf_append(ar, @addr(b), SEARCH_CLOSE)
-    util.abuf_append(ar, @addr(b), ICON_HOME)
-    util.abuf_append(ar, @addr(b), ACTIONS_MID)
     util.abuf_append(ar, @addr(b), ICON_SUN)
     util.abuf_append(ar, @addr(b), ICON_MOON)
     util.abuf_append(ar, @addr(b), ACTIONS_END)
@@ -404,12 +314,8 @@ pub fn render_page(
         util.abuf_append(ar, @addr(b), page.toc)
         util.abuf_append(ar, @addr(b), SIDEBAR_TOC_CLOSE)
     }
-    util.abuf_append(ar, @addr(b), SIDEBAR_MENU_OPEN)
-    util.abuf_append(ar, @addr(b), ICON_HOME)
-    util.abuf_append(ar, @addr(b), SIDEBAR_MENU_MID)
     render_nav(ar, @addr(b), root, page.url)
-    util.abuf_append(ar, @addr(b), SIDEBAR_MENU_END)
-    render_breadcrumbs(ar, la, @addr(b), root, page)
+    util.abuf_append(ar, @addr(b), SIDEBAR_CLOSE)
     util.abuf_append(ar, @addr(b), PAGE_HEADER_OPEN)
     attr(ar, @addr(b), page.title)
     if page.description.len > 0 {
@@ -484,9 +390,13 @@ pub fn render_404(
         \\<body>
         \\<header class="topbar">
         \\  <a class="brand" href="/">
-        \\    <span class="brand-mark" aria-hidden="true">S</span>
-        \\    <span class="brand-title">
     )
+    if cfg.icon.len > 0 {
+        util.abuf_append(ar, @addr(b), "    <span class=\"brand-mark\" aria-hidden=\"true\">")
+        attr(ar, @addr(b), cfg.icon)
+        util.abuf_append(ar, @addr(b), "</span>\n")
+    }
+    util.abuf_append(ar, @addr(b), "    <span class=\"brand-title\">")
     attr(ar, @addr(b), cfg.title)
     util.abuf_append(ar, @addr(b),
         \\</span>
@@ -494,7 +404,6 @@ pub fn render_404(
         \\</header>
         \\<main class="main" id="main-content">
         \\  <div class="content not-found">
-        \\    <p class="breadcrumbs">404</p>
         \\    <h1 class="page-title">Page not found</h1>
         \\    <p class="page-description">The page you requested does not exist in this documentation set.</p>
         \\    <p><a href="/">Return to the home page</a></p>

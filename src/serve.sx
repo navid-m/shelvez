@@ -207,7 +207,6 @@ fn handle_request(
     ws: mut ref build.Workspace,
     root: str.StringView,
     req_arena: allocators.ScopedArenaAllocator,
-    req_la: allocators.ListArena,
     sig_arena: allocators.ScopedArenaAllocator,
     sig_la: allocators.ListArena,
     fd: i64,
@@ -322,7 +321,6 @@ fn handle_request(
         some item => {
             val html: str.StringView = page.render_page(
                 req_arena,
-                req_la,
                 ws.site.cfg,
                 ws.site.nav,
                 ws.site.pages,
@@ -433,7 +431,6 @@ pub fn serve(
             return err errors.E_OUT_OF_MEMORY
         }
     }
-    val req_la: allocators.ListArena = {arena: req_arena}
     val current_sig: mut u64 = build.signature(sig_arena, sig_la, ws.site.cfg)
     stdio.puts("")
     stdio.puts("Shelvez development server")
@@ -450,7 +447,6 @@ pub fn serve(
                 ws,
                 root,
                 req_arena,
-                req_la,
                 sig_arena,
                 sig_la,
                 client,

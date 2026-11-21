@@ -107,6 +107,7 @@ val DOC_CONFIGURATION: str.StringView = \\# Configuration
 \\| --- | --- |
 \\| `title` | Site name shown in the header and browser title. |
 \\| `description` | Default meta description. |
+\\| `icon` | Optional short text shown as a square mark before the title. |
 \\| `content` | Folder containing Markdown and static assets. |
 \\| `structure` | `"inferred"` or an explicit array of sections and pages. |
 \\| `port` | Default port for `shelvez serve`. |

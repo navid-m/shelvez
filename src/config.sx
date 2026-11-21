@@ -17,6 +17,7 @@ pub type NavSpec = {
 pub type Config = {
     title: mut str.StringView
     description: mut str.StringView
+    icon: mut str.StringView
     content: mut str.StringView
     port: mut i64
     inferred: mut bool
@@ -162,6 +163,7 @@ pub fn load_config(
             val cfg: mut Config = @zeroed
             cfg.title = "Documentation"
             cfg.description = ""
+            cfg.icon = ""
             cfg.content = "docs"
             cfg.port = 3000
             cfg.inferred = true
@@ -173,6 +175,9 @@ pub fn load_config(
                 }
                 if json.object_get_str(value, "description") is some v {
                     cfg.description = util.alloc_view(ar, v)
+                }
+                if json.object_get_str(value, "icon") is some v {
+                    cfg.icon = util.alloc_view(ar, v)
                 }
                 if json.object_get_str(value, "content") is some v {
                     cfg.content = util.alloc_view(ar, v)
