@@ -1,0 +1,230 @@
+val build  = use("build.sx")
+val errors = use("errors.sx")
+val init   = use("init.sx")
+val os     = use("std/os")
+val serve  = use("serve.sx")
+val stdio  = use("std/stdio")
+val str    = use("std/string")
+
+val USAGE: str.StringView = \\Shelvez - a static documentation generator
+\\
+\\Usage:
+\\  shelvez init [directory] [--force]
+\\  shelvez serve [--port <port>]
+\\  shelvez build [--force]
+\\
+\\Commands:
+\\  init    Create index.json and an example docs/ tree.
+\\  serve   Serve the documentation with live reload.
+\\  build   Render the site into ./dist/.
+\\
+\\Options:
+\\  -p, --port <port>   Port for the development server.
+\\  -f, --force         Skip the dist/ overwrite prompt, or
+\\                      overwrite files during init.
+\\  -h, --help          Show this help.
+\\  -v, --version       Show the version.
+
+fn arg(args: list[ref u8], index: i64) str.StringView = trust {
+    match @get(args, index as usize) {
+        some value => {
+            return str.from_cstr(value)
+        }
+        none => {
+            return ""
+        }
+    }
+}
+
+fn parse_port(text: str.StringView) i64 = trust {
+    if text.len == 0 {
+        return -1
+    }
+    val value: mut i64 = 0
+    val i: mut i64 = 0
+    for {
+        if i >= text.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(text.ptr, i))
+        if c < 48 || c > 57 {
+            return -1
+        }
+        value = value * 10 + (c as i64 - 48)
+        i++
+    }
+    if value < 1 || value > 65535 {
+        return -1
+    }
+    return value
+}
+
+fn print_usage() void = trust {
+    stdio.puts(USAGE)
+}
+
+fn run_init(args: list[ref u8], count: i64) i32 = trust {
+    val directory: mut str.StringView = "."
+    val force: mut bool = false
+    val seen_directory: mut bool = false
+    val i: mut i64 = 2
+    for {
+        if i >= count {
+            break
+        }
+        val value: str.StringView = arg(args, i)
+        if str.eql(value, "--force") || str.eql(value, "-f") {
+            force = true
+        } elif str.eql(value, "--help") || str.eql(value, "-h") {
+            print_usage()
+            return 0
+        } elif str.starts_with(value, "-") {
+            stdio.print("Unknown option: {s}\n", {value})
+            return 1
+        } else {
+            if seen_directory {
+                stdio.puts("init accepts at most one directory.")
+                return 1
+            }
+            directory = value
+            seen_directory = true
+        }
+        i++
+    }
+    return init.init(directory, force)
+}
+
+fn run_build(args: list[ref u8], count: i64) i32 = trust {
+    val force: mut bool = false
+    val i: mut i64 = 2
+    for {
+        if i >= count {
+            break
+        }
+        val value: str.StringView = arg(args, i)
+        if str.eql(value, "--force") || str.eql(value, "-f") {
+            force = true
+        } elif str.eql(value, "--help") || str.eql(value, "-h") {
+            print_usage()
+            return 0
+        } else {
+            stdio.print("Unknown option: {s}\n", {value})
+            return 1
+        }
+        i++
+    }
+    match build.build(".", force) {
+        ok stats => {
+            if stats.pages > 0 {
+                stdio.print(
+                    "Built {d} pages and {d} assets into dist/\n",
+                    {stats.pages, stats.assets}
+                )
+            }
+            return 0
+        }
+        err code => {
+            if code == errors.E_CONFIG_MISSING {
+                stdio.puts("No index.json found. Run `shelvez init` first.")
+            } elif code == errors.E_CONFIG_INVALID {
+                stdio.puts("index.json is invalid.")
+            } elif code == errors.E_CONTENT_MISSING {
+                stdio.puts("The content directory does not exist.")
+            } elif code == errors.E_PAGE_MISSING {
+                stdio.puts("An explicit structure entry points to a missing page.")
+            } elif code == errors.E_OUTPUT {
+                stdio.puts("Could not write the output site into dist/.")
+            } else {
+                stdio.puts("Out of memory while building the site.")
+            }
+            return 1
+        }
+    }
+}
+
+fn run_serve(args: list[ref u8], count: i64) i32 = trust {
+    val port: mut i64 = 0
+    val i: mut i64 = 2
+    for {
+        if i >= count {
+            break
+        }
+        val value: str.StringView = arg(args, i)
+        if str.eql(value, "--port") || str.eql(value, "-p") {
+            i++
+            if i >= count {
+                stdio.puts("--port requires a value.")
+                return 1
+            }
+            port = parse_port(arg(args, i))
+            if port < 0 {
+                stdio.puts("Invalid port.")
+                return 1
+            }
+        } elif str.starts_with(value, "--port=") {
+            port = parse_port(str.slice(value, 7, value.len))
+            if port < 0 {
+                stdio.puts("Invalid port.")
+                return 1
+            }
+        } elif str.eql(value, "--help") || str.eql(value, "-h") {
+            print_usage()
+            return 0
+        } else {
+            stdio.print("Unknown option: {s}\n", {value})
+            return 1
+        }
+        i++
+    }
+    match serve.serve(".", port) {
+        ok _ => {
+            return 0
+        }
+        err code => {
+            if code == errors.E_LISTEN {
+                stdio.puts("Could not start the development server. Is the port already in use?")
+            } elif code == errors.E_CONFIG_MISSING {
+                stdio.puts("No index.json found. Run `shelvez init` first.")
+            } elif code == errors.E_CONFIG_INVALID {
+                stdio.puts("index.json is invalid.")
+            } elif code == errors.E_CONTENT_MISSING {
+                stdio.puts("The content directory does not exist.")
+            } elif code == errors.E_PAGE_MISSING {
+                stdio.puts("An explicit structure entry points to a missing page.")
+            } else {
+                stdio.puts("Could not build the documentation. Check index.json and docs/.")
+            }
+            return 1
+        }
+    }
+}
+
+pub fn main() i32 = trust {
+    val args = os.get_args()
+    val count: i64 = @len(args) as i64
+    if count < 2 {
+        print_usage()
+        return 1
+    }
+    val command: str.StringView = arg(args, 1)
+    if str.eql(command, "init") {
+        return run_init(args, count)
+    }
+    if str.eql(command, "serve") {
+        return run_serve(args, count)
+    }
+    if str.eql(command, "build") {
+        return run_build(args, count)
+    }
+    if str.eql(command, "--help") || str.eql(command, "-h") || str.eql(command, "help") {
+        print_usage()
+        return 0
+    }
+    if str.eql(command, "--version") || str.eql(command, "-v") {
+        stdio.puts("shelvez 0.1.0")
+        return 0
+    }
+    stdio.print("Unknown command: {s}\n", {command})
+    print_usage()
+    return 1
+}

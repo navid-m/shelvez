@@ -1,0 +1,246 @@
+/// Parsing for the root `index.json` configuration.
+
+val allocators = use("std/allocators")
+val errors     = use("errors.sx")
+val json       = use("std/json")
+val str        = use("std/string")
+val util       = use("sxutil.sx")
+
+/// One explicit sidebar entry. Pages have a non-empty `path`; sections have
+/// children instead.
+pub type NavSpec = {
+    title: mut str.StringView
+    path: mut str.StringView
+    children: mut list[ref NavSpec]
+}
+
+pub type Config = {
+    title: mut str.StringView
+    description: mut str.StringView
+    content: mut str.StringView
+    port: mut i64
+    inferred: mut bool
+    root: mut str.StringView
+    nav: mut ref NavSpec
+}
+
+fn nav_list(la: allocators.ListArena) option[list[ref NavSpec]] = trust {
+    match @listalloc[allocators.ListArena, ref NavSpec](la) {
+        ok l => {
+            return some l
+        }
+        err _ => {
+            return none
+        }
+    }
+}
+
+fn empty_nav(ar: allocators.ScopedArenaAllocator) mut ref NavSpec = trust {
+    val node: ref NavSpec = allocators.ScopedArena.alloc_or_none(
+        ar,
+        @sizeof(NavSpec) as usize
+    ) as ref NavSpec
+    return node
+}
+
+fn parse_nav(
+    ar: allocators.ScopedArenaAllocator,
+    la: allocators.ListArena,
+    value: json.JsonValue
+) option[ref NavSpec] = trust {
+    if json.is_string(value) {
+        val path: str.StringView = util.alloc_view(ar, json.as_string(value))
+        val node: mut ref NavSpec = empty_nav(ar)
+        if node == none {
+            return none
+        }
+        node.title = util.prettify_name(ar, util.view_stem(util.view_base(path)))
+        node.path = path
+        match nav_list(la) {
+            some children => {
+                node.children = children
+                return some node
+            }
+            none => {
+                return none
+            }
+        }
+    }
+    if !json.is_object(value) {
+        return none
+    }
+    val node: mut ref NavSpec = empty_nav(ar)
+    if node == none {
+        return none
+    }
+    node.title = ""
+    node.path = ""
+    match json.object_get_str(value, "title") {
+        some title => {
+            node.title = util.alloc_view(ar, title)
+        }
+        none => {
+            node.title = ""
+        }
+    }
+    match json.object_get_str(value, "path") {
+        some path => {
+            node.path = util.alloc_view(ar, path)
+        }
+        none => {
+            node.path = ""
+        }
+    }
+    if node.title.len == 0 {
+        if node.path.len > 0 {
+            node.title = util.prettify_name(ar, util.view_stem(util.view_base(node.path)))
+        }
+    }
+    match nav_list(la) {
+        some children => {
+            node.children = children
+        }
+        none => {
+            return none
+        }
+    }
+    if json.object_get(value, "children") is some kids {
+        if json.is_array(kids) {
+            val n: i64 = json.len(kids)
+            val i: mut i64 = 0
+            for {
+                if i >= n {
+                    break
+                }
+                match json.array_get(kids, i) {
+                    some item => {
+                        match parse_nav(ar, la, item) {
+                            some child => {
+                                @append(node.children, child)
+                            }
+                            none => {
+                                return none
+                            }
+                        }
+                    }
+                    none => {
+                        return none
+                    }
+                }
+                i++
+            }
+        }
+    }
+    if node.title.len == 0 {
+        node.title = "Section"
+    }
+    return some node
+}
+
+pub fn load_config(
+    ar: allocators.ScopedArenaAllocator,
+    la: allocators.ListArena,
+    root: str.StringView
+) result[Config, i64] = trust {
+    val path: str.StringView = util.path_join(ar, root, "index.json")
+    val src: mut str.StringView = ""
+    match util.read_file(ar, path) {
+        some text => {
+            src = text
+        }
+        none => {
+            return err errors.E_CONFIG_MISSING
+        }
+    }
+    val parsed = json.parse(src)
+    match parsed {
+        err _ => {
+            return err errors.E_CONFIG_INVALID
+        }
+        ok doc => {
+            val value: json.JsonValue = json.root(doc)
+            val cfg: mut Config = @zeroed
+            cfg.title = "Documentation"
+            cfg.description = ""
+            cfg.content = "docs"
+            cfg.port = 3000
+            cfg.inferred = true
+            cfg.root = util.alloc_view(ar, root)
+            cfg.nav = empty_nav(ar)
+            if json.is_object(value) {
+                if json.object_get_str(value, "title") is some v {
+                    cfg.title = util.alloc_view(ar, v)
+                }
+                if json.object_get_str(value, "description") is some v {
+                    cfg.description = util.alloc_view(ar, v)
+                }
+                if json.object_get_str(value, "content") is some v {
+                    cfg.content = util.alloc_view(ar, v)
+                }
+                if json.object_get_int(value, "port") is some v {
+                    cfg.port = v
+                }
+                if json.object_get(value, "structure") is some structure {
+                    if json.is_string(structure) {
+                        if str.eql(json.as_string(structure), "inferred") {
+                            cfg.inferred = true
+                        } else {
+                            cfg.inferred = false
+                            json.doc_free(doc)
+                            return err errors.E_CONFIG_INVALID
+                        }
+                    } elif json.is_array(structure) {
+                        cfg.inferred = false
+                        val root_node: mut ref NavSpec = empty_nav(ar)
+                        if root_node == none {
+                            json.doc_free(doc)
+                            return err errors.E_OUT_OF_MEMORY
+                        }
+                        root_node.title = cfg.title
+                        root_node.path = ""
+                        match nav_list(la) {
+                            some children => {
+                                root_node.children = children
+                            }
+                            none => {
+                                json.doc_free(doc)
+                                return err errors.E_OUT_OF_MEMORY
+                            }
+                        }
+                        val n: i64 = json.len(structure)
+                        val i: mut i64 = 0
+                        for {
+                            if i >= n {
+                                break
+                            }
+                            match json.array_get(structure, i) {
+                                some item => {
+                                    match parse_nav(ar, la, item) {
+                                        some child => {
+                                            @append(root_node.children, child)
+                                        }
+                                        none => {
+                                            json.doc_free(doc)
+                                            return err errors.E_CONFIG_INVALID
+                                        }
+                                    }
+                                }
+                                none => {
+                                    json.doc_free(doc)
+                                    return err errors.E_CONFIG_INVALID
+                                }
+                            }
+                            i++
+                        }
+                        cfg.nav = root_node
+                    } else {
+                        json.doc_free(doc)
+                        return err errors.E_CONFIG_INVALID
+                    }
+                }
+            }
+            json.doc_free(doc)
+            return ok cfg
+        }
+    }
+}

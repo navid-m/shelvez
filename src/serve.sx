@@ -1,0 +1,475 @@
+/// Development server with file watching and browser reload.
+
+val allocators = use("std/allocators")
+val build      = use("build.sx")
+val config     = use("config.sx")
+val errors     = use("errors.sx")
+val fs         = use("std/fs")
+val net        = use("std/net")
+val page       = use("page.sx")
+val stdio      = use("std/stdio")
+val str        = use("std/string")
+val time       = use("std/time")
+val tree       = use("tree.sx")
+val util       = use("sxutil.sx")
+
+fn find_page(
+    pages: list[ref tree.Page],
+    raw_path: str.StringView
+) option[ref tree.Page] = trust {
+    val n: i64 = @len(pages) as i64
+    val i: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        if @get(pages, i as usize) is some candidate {
+            if str.eql(candidate.url, raw_path) {
+                return some candidate
+            }
+        }
+        i++
+    }
+    return none
+}
+
+fn send_all(fd: i64, data: ref u8, len: i64) void = trust {
+    val sent: mut i64 = 0
+    for {
+        if sent >= len {
+            break
+        }
+        val n: i64 = net.TcpServer.send(fd, @ptradd(data, sent), len - sent)
+        if n <= 0 {
+            break
+        }
+        sent = sent + n
+    }
+}
+
+fn status_text(code: i64) str.StringView = trust {
+    if code == 200 {
+        return "OK"
+    }
+    if code == 301 {
+        return "Moved Permanently"
+    }
+    if code == 405 {
+        return "Method Not Allowed"
+    }
+    if code == 500 {
+        return "Internal Server Error"
+    }
+    return "Not Found"
+}
+
+fn respond(
+    ar: allocators.ScopedArenaAllocator,
+    fd: i64,
+    code: i64,
+    content_type: str.StringView,
+    body: str.StringView,
+    head_only: bool
+) void = trust {
+    val header: mut util.ABuf = util.abuf_new(ar)
+    util.abuf_append(ar, @addr(header), "HTTP/1.1 ")
+    util.abuf_append_int(ar, @addr(header), code)
+    util.abuf_append(ar, @addr(header), " ")
+    util.abuf_append(ar, @addr(header), status_text(code))
+    util.abuf_append(ar, @addr(header), "\r\nContent-Type: ")
+    util.abuf_append(ar, @addr(header), content_type)
+    util.abuf_append(ar, @addr(header), "\r\nContent-Length: ")
+    util.abuf_append_int(ar, @addr(header), body.len)
+    util.abuf_append(
+        ar,
+        @addr(header),
+        "\r\nCache-Control: no-store, no-cache, must-revalidate\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n"
+    )
+    val hv: str.StringView = util.abuf_view(@addr(header))
+    send_all(fd, hv.ptr, hv.len)
+    if !head_only && body.len > 0 {
+        send_all(fd, body.ptr, body.len)
+    }
+}
+
+fn mime_for(path: str.StringView) str.StringView = trust {
+    if util.path_lower_ext_is(path, c".css") {
+        return "text/css; charset=utf-8"
+    }
+    if util.path_lower_ext_is(path, c".js") {
+        return "application/javascript; charset=utf-8"
+    }
+    if util.path_lower_ext_is(path, c".json") {
+        return "application/json; charset=utf-8"
+    }
+    if util.path_lower_ext_is(path, c".html") {
+        return "text/html; charset=utf-8"
+    }
+    if util.path_lower_ext_is(path, c".svg") {
+        return "image/svg+xml"
+    }
+    if util.path_lower_ext_is(path, c".png") {
+        return "image/png"
+    }
+    if util.path_lower_ext_is(path, c".jpg") || util.path_lower_ext_is(path, c".jpeg") {
+        return "image/jpeg"
+    }
+    if util.path_lower_ext_is(path, c".gif") {
+        return "image/gif"
+    }
+    if util.path_lower_ext_is(path, c".webp") {
+        return "image/webp"
+    }
+    if util.path_lower_ext_is(path, c".ico") {
+        return "image/x-icon"
+    }
+    if util.path_lower_ext_is(path, c".woff2") {
+        return "font/woff2"
+    }
+    if util.path_lower_ext_is(path, c".woff") {
+        return "font/woff"
+    }
+    if util.path_lower_ext_is(path, c".txt") || util.path_lower_ext_is(path, c".md") {
+        return "text/plain; charset=utf-8"
+    }
+    return "application/octet-stream"
+}
+
+fn has_dotdot(path: str.StringView) bool = trust {
+    return str.contains(path, "..")
+}
+
+fn serve_file(
+    req_arena: allocators.ScopedArenaAllocator,
+    fd: i64,
+    cfg: config.Config,
+    content_dir: str.StringView,
+    decoded: str.StringView,
+    head_only: bool
+) void = trust {
+    val rel: mut str.StringView = decoded
+    if rel.len > 0 && @load8(rel.ptr) == 47 {
+        rel = str.slice(rel, 1, rel.len)
+    }
+    if rel.len == 0 || has_dotdot(rel) {
+        val body: str.StringView = page.render_404(req_arena, cfg)
+        respond(req_arena, fd, 404, "text/html; charset=utf-8", body, head_only)
+        return
+    }
+    val file_path: str.StringView = util.normalize_rel(
+        req_arena,
+        util.path_join(req_arena, content_dir, rel)
+    )
+    if !util.file_exists(file_path) || fs.is_directory(file_path) {
+        val body: str.StringView = page.render_404(req_arena, cfg)
+        respond(req_arena, fd, 404, "text/html; charset=utf-8", body, head_only)
+        return
+    }
+    val size_opt = fs.file_size(file_path)
+    val size: mut i64 = 0
+    if size_opt is some value {
+        size = value
+    }
+    val data = fs.read_all_heap(file_path)
+    match data {
+        some raw => {
+            val body: str.StringView = str.view(raw as ref u8, size)
+            respond(req_arena, fd, 200, mime_for(file_path), body, head_only)
+            @free(raw as ref void)
+        }
+        none => {
+            respond(req_arena, fd, 500, "text/plain; charset=utf-8", "read failed", head_only)
+        }
+    }
+}
+
+fn refresh(
+    ws: mut ref build.Workspace,
+    root: str.StringView,
+    sig_arena: allocators.ScopedArenaAllocator,
+    sig_la: allocators.ListArena,
+    current: u64
+) u64 = trust {
+    allocators.ScopedArena.reset(sig_arena)
+    val next: u64 = build.signature(sig_arena, sig_la, ws.site.cfg)
+    if next == current {
+        return current
+    }
+    if build.workspace_reload(ws, root) {
+        stdio.print("Reloaded {d} pages.\n", {@len(ws.site.pages)})
+        return next
+    }
+    stdio.eputs("Reload failed; keeping the previous build.\n")
+    return next
+}
+
+fn handle_request(
+    ws: mut ref build.Workspace,
+    root: str.StringView,
+    req_arena: allocators.ScopedArenaAllocator,
+    req_la: allocators.ListArena,
+    sig_arena: allocators.ScopedArenaAllocator,
+    sig_la: allocators.ListArena,
+    fd: i64,
+    current_sig: mut u64
+) void = trust {
+    val buf: ref u8 = @alloc(8192) as ref u8
+    if buf == none {
+        respond(req_arena, fd, 500, "text/plain; charset=utf-8", "out of memory", false)
+        return
+    }
+    val total: mut i64 = 0
+    for {
+        if total >= 8191 {
+            break
+        }
+        val n: i64 = net.TcpServer.recv(fd, @ptradd(buf, total), 8191 - total)
+        if n <= 0 {
+            break
+        }
+        total = total + n
+        @store8(@ptradd(buf, total), 0)
+        if str.contains(str.view(buf, total), "\r\n\r\n") {
+            break
+        }
+    }
+    if total == 0 {
+        @free(buf as ref void)
+        return
+    }
+    val request: str.StringView = str.view(buf, total)
+    val sp1_opt = str.find(request, " ")
+    val sp1: mut i64 = -1
+    if sp1_opt is some value {
+        sp1 = value
+    }
+    if sp1 < 0 {
+        @free(buf as ref void)
+        respond(req_arena, fd, 405, "text/plain; charset=utf-8", "bad request", false)
+        return
+    }
+    val method: str.StringView = str.slice(request, 0, sp1)
+    val rest: str.StringView = str.slice(request, sp1 + 1, request.len)
+    val sp2_opt = str.find(rest, " ")
+    val sp2: mut i64 = -1
+    if sp2_opt is some value {
+        sp2 = value
+    }
+    val target: mut str.StringView = rest
+    if sp2 >= 0 {
+        target = str.slice(rest, 0, sp2)
+    }
+    val head_only: bool = str.eql(method, "HEAD")
+    if !str.eql(method, "GET") && !head_only {
+        @free(buf as ref void)
+        respond(req_arena, fd, 405, "text/plain; charset=utf-8", "method not allowed", false)
+        return
+    }
+    val raw_path: mut str.StringView = target
+    if str.find(target, "?") is some cut {
+        raw_path = str.slice(target, 0, cut)
+    }
+    val decoded: str.StringView = util.url_decode(req_arena, raw_path)
+    if str.eql(raw_path, "/__shelvez/version") {
+        current_sig = refresh(ws, root, sig_arena, sig_la, current_sig)
+        val out: mut util.ABuf = util.abuf_new(req_arena)
+        util.abuf_append_int(req_arena, @addr(out), current_sig as i64)
+        respond(req_arena, fd, 200, "text/plain; charset=utf-8", util.abuf_view(@addr(out)), false)
+        @free(buf as ref void)
+        return
+    }
+    if str.eql(raw_path, "/assets/style.css") {
+        respond(req_arena, fd, 200, "text/css; charset=utf-8", page.asset_css(), head_only)
+        @free(buf as ref void)
+        return
+    }
+    if str.eql(raw_path, "/assets/shelvez.js") {
+        respond(
+            req_arena,
+            fd,
+            200,
+            "application/javascript; charset=utf-8",
+            page.asset_js(),
+            head_only
+        )
+        @free(buf as ref void)
+        return
+    }
+    if str.eql(raw_path, "/assets/search.json") {
+        val body: str.StringView = page.build_search_json(req_arena, ws.site.pages)
+        respond(req_arena, fd, 200, "application/json; charset=utf-8", body, head_only)
+        @free(buf as ref void)
+        return
+    }
+    if str.eql(raw_path, "/assets/favicon.svg") || str.eql(raw_path, "/favicon.ico") {
+        respond(req_arena, fd, 200, "image/svg+xml", page.asset_favicon(), head_only)
+        @free(buf as ref void)
+        return
+    }
+    if str.eql(raw_path, "/assets/theme.js") {
+        respond(
+            req_arena,
+            fd,
+            200,
+            "application/javascript; charset=utf-8",
+            page.asset_theme(),
+            head_only
+        )
+        @free(buf as ref void)
+        return
+    }
+    match find_page(ws.site.pages, raw_path) {
+        some item => {
+            val html: str.StringView = page.render_page(
+                req_arena,
+                req_la,
+                ws.site.cfg,
+                ws.site.nav,
+                ws.site.pages,
+                item,
+                true,
+                current_sig as i64
+            )
+            respond(req_arena, fd, 200, "text/html; charset=utf-8", html, head_only)
+        }
+        none => {
+            val redirect: mut str.StringView = ""
+            if str.eql(raw_path, "/") {
+                redirect = page.home_url(ws.site.pages)
+            } elif raw_path.len > 0 && @load8(@ptradd(raw_path.ptr, raw_path.len - 1)) != 47 &&
+            util.view_ext(raw_path).len == 0 {
+                val with_slash: str.StringView = util.view_concat3(req_arena, raw_path, "/", "")
+                if find_page(ws.site.pages, with_slash) is some _ {
+                    redirect = with_slash
+                }
+            }
+            if redirect.len > 0 && !str.eql(redirect, raw_path) {
+                val header: mut util.ABuf = util.abuf_new(req_arena)
+                util.abuf_append(
+                    req_arena,
+                    @addr(header),
+                    "HTTP/1.1 301 Moved Permanently\r\nLocation: "
+                )
+                util.abuf_append(req_arena, @addr(header), redirect)
+                util.abuf_append(
+                    req_arena,
+                    @addr(header),
+                    "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                val hv: str.StringView = util.abuf_view(@addr(header))
+                send_all(fd, hv.ptr, hv.len)
+            } else {
+                val content_dir: str.StringView = util.path_join(
+                    req_arena,
+                    root,
+                    ws.site.cfg.content
+                )
+                if raw_path.len > 0 && !str.eql(raw_path, "/") {
+                    serve_file(req_arena, fd, ws.site.cfg, content_dir, decoded, head_only)
+                } else {
+                    val body: str.StringView = page.render_404(req_arena, ws.site.cfg)
+                    respond(req_arena, fd, 404, "text/html; charset=utf-8", body, head_only)
+                }
+            }
+        }
+    }
+    @free(buf as ref void)
+}
+
+pub fn serve(
+    root: str.StringView,
+    port_override: i64
+) result[void, i64] = trust {
+    val ws: mut ref build.Workspace = none
+    match build.create_workspace(root) {
+        ok value => {
+            ws = value
+        }
+        err code => {
+            return err code
+        }
+    }
+    val heap: allocators.HeapAllocator = @zeroed
+    val base_port: mut i64 = ws.site.cfg.port
+    if port_override > 0 {
+        base_port = port_override
+    }
+    if base_port <= 0 || base_port > 65535 {
+        base_port = 3000
+    }
+    val server = net.TcpServer.listen[allocators.HeapAllocator](
+        heap,
+        base_port as i32
+    )
+    if server == none {
+        build.workspace_free(ws)
+        return err errors.E_LISTEN
+    }
+    val port: i64 = base_port
+    net.TcpServer.set_non_blocking(net.TcpServer.fd(server))
+    val sig_arena_opt = allocators.ScopedArena.new(65536 as usize)
+    val sig_arena: mut allocators.ScopedArenaAllocator = none
+    match sig_arena_opt {
+        ok a => {
+            sig_arena = a
+        }
+        err _ => {
+            net.TcpServer.close[allocators.HeapAllocator](heap, server)
+            build.workspace_free(ws)
+            return err errors.E_OUT_OF_MEMORY
+        }
+    }
+    val sig_la: allocators.ListArena = {arena: sig_arena}
+    val req_arena_opt = allocators.ScopedArena.new(262144 as usize)
+    val req_arena: mut allocators.ScopedArenaAllocator = none
+    match req_arena_opt {
+        ok a => {
+            req_arena = a
+        }
+        err _ => {
+            allocators.ScopedArena.free(sig_arena)
+            net.TcpServer.close[allocators.HeapAllocator](heap, server)
+            build.workspace_free(ws)
+            return err errors.E_OUT_OF_MEMORY
+        }
+    }
+    val req_la: allocators.ListArena = {arena: req_arena}
+    val current_sig: mut u64 = build.signature(sig_arena, sig_la, ws.site.cfg)
+    stdio.puts("")
+    stdio.puts("Shelvez development server")
+    stdio.print("  http://localhost:{d}\n", {port})
+    stdio.print("  content: {s}\n", {ws.site.cfg.content})
+    stdio.puts("  press Ctrl+C to stop")
+    stdio.puts("")
+    val idle: mut i64 = 0
+    for {
+        val client: i64 = net.TcpServer.accept(server)
+        if client >= 0 {
+            allocators.ScopedArena.reset(req_arena)
+            handle_request(
+                ws,
+                root,
+                req_arena,
+                req_la,
+                sig_arena,
+                sig_la,
+                client,
+                current_sig
+            )
+            net.TcpServer.close_client(client)
+            idle = 0
+            continue
+        }
+        time.sleep_millis(200)
+        idle++
+        if idle >= 5 {
+            idle = 0
+            current_sig = refresh(ws, root, sig_arena, sig_la, current_sig)
+        }
+    }
+    net.TcpServer.close[allocators.HeapAllocator](heap, server)
+    allocators.ScopedArena.free(req_arena)
+    allocators.ScopedArena.free(sig_arena)
+    build.workspace_free(ws)
+    return ok()
+}

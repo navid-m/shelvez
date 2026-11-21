@@ -1,0 +1,666 @@
+/// Shared helpers for shelvez: arena-backed byte buffers, paths,
+/// escaping, and file access.
+
+val allocators = use("std/allocators")
+val fs         = use("std/fs")
+val str        = use("std/string")
+
+/// A growable byte buffer allocated from a scoped arena.
+///
+/// Growth allocates a fresh block from the same arena and copies the old
+/// contents; the whole buffer is released when the arena is reset or freed.
+pub type ABuf = {
+    ptr: mut ref u8
+    len: mut i64
+    cap: mut i64
+}
+
+pub fn abuf_new(ar: allocators.ScopedArenaAllocator) ABuf = trust {
+    val cap: i64 = 256
+    val raw: ref void = allocators.ScopedArena.alloc_or_none(ar, cap as usize)
+    if raw == none {
+        return ABuf{ptr: none, len: 0, cap: 0}
+    }
+    val b: mut ABuf = ABuf{ptr: raw as ref u8, len: 0, cap: cap}
+    @store8(b.ptr, 0)
+    return b
+}
+
+pub fn abuf_reserve(
+    ar: allocators.ScopedArenaAllocator,
+    b: mut ref ABuf,
+    needed: i64
+) void = trust {
+    if needed <= b.cap {
+        return
+    }
+    val newcap: mut i64 = b.cap * 2
+    if newcap < needed {
+        newcap = needed + 64
+    }
+    if newcap < 256 {
+        newcap = 256
+    }
+    val raw: ref void = allocators.ScopedArena.alloc_or_none(ar, newcap as usize)
+    if raw == none {
+        return
+    }
+    if b.len > 0 {
+        @memcpy(raw, b.ptr as ref void, b.len as usize)
+    }
+    b.ptr = raw as ref u8
+    b.cap = newcap
+    @store8(@ptradd(b.ptr, b.len), 0)
+}
+
+pub fn abuf_append(
+    ar: allocators.ScopedArenaAllocator,
+    b: mut ref ABuf,
+    v: str.StringView
+) void = trust {
+    if v.len <= 0 {
+        return
+    }
+    abuf_reserve(ar, b, b.len + v.len + 1)
+    if b.cap < b.len + v.len + 1 {
+        return
+    }
+    @memcpy(@ptradd(b.ptr, b.len), v.ptr as ref void, v.len as usize)
+    b.len = b.len + v.len
+    @store8(@ptradd(b.ptr, b.len), 0)
+}
+
+pub fn abuf_append_cstr(
+    ar: allocators.ScopedArenaAllocator,
+    b: mut ref ABuf,
+    s: ref u8
+) void = trust {
+    abuf_append(ar, b, str.from_cstr(s))
+}
+
+pub fn abuf_append_char(
+    ar: allocators.ScopedArenaAllocator,
+    b: mut ref ABuf,
+    c: u8
+) void = trust {
+    abuf_reserve(ar, b, b.len + 2)
+    if b.cap < b.len + 2 {
+        return
+    }
+    @store8(@ptradd(b.ptr, b.len), c)
+    b.len = b.len + 1
+    @store8(@ptradd(b.ptr, b.len), 0)
+}
+
+pub fn abuf_clear(b: mut ref ABuf) void = trust {
+    b.len = 0
+    if b.ptr != none {
+        @store8(b.ptr, 0)
+    }
+}
+
+pub fn abuf_view(b: ref ABuf) str.StringView = {
+    return str.view(b.ptr, b.len)
+}
+
+pub fn abuf_append_int(
+    ar: allocators.ScopedArenaAllocator,
+    b: mut ref ABuf,
+    value: i64
+) void = trust {
+    val negative: bool = value < 0
+    val mag: mut u64 = value as u64
+    if negative {
+        mag = (0 as u64) - mag
+    }
+    val tmp: mut [32]u8 = @zeroed
+    val tmp_ptr: ref u8 = @addr(tmp) as ref u8
+    val n: mut i64 = 0
+    if mag == 0 {
+        @store8(tmp_ptr, 48)
+        n = 1
+    }
+    for {
+        if mag == 0 {
+            break
+        }
+        @store8(@ptradd(tmp_ptr, n), (48 as u64 + (mag % 10)) as u8)
+        mag = mag / 10
+        n++
+    }
+    if negative {
+        abuf_append_char(ar, b, 45)
+    }
+    val i: mut i64 = n - 1
+    for {
+        if i < 0 {
+            break
+        }
+        abuf_append_char(ar, b, @load8(@ptradd(tmp_ptr, i)))
+        i--
+    }
+}
+
+pub fn html_escape(
+    ar: allocators.ScopedArenaAllocator,
+    b: mut ref ABuf,
+    s: str.StringView
+) void = trust {
+    val i: mut i64 = 0
+    val start: mut i64 = 0
+    for {
+        if i >= s.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s.ptr, i))
+        val replacement: mut str.StringView = ""
+        val special: mut bool = true
+        if c == 38 {
+            replacement = "&amp;"
+        } elif c == 60 {
+            replacement = "&lt;"
+        } elif c == 62 {
+            replacement = "&gt;"
+        } elif c == 34 {
+            replacement = "&quot;"
+        } elif c == 39 {
+            replacement = "&#39;"
+        } else {
+            special = false
+        }
+        if special {
+            if i > start {
+                abuf_append(ar, b, str.slice(s, start, i))
+            }
+            abuf_append(ar, b, replacement)
+            start = i + 1
+        }
+        i++
+    }
+    if start < s.len {
+        abuf_append(ar, b, str.slice(s, start, s.len))
+    }
+}
+
+pub fn html_escape_buf(
+    ar: allocators.ScopedArenaAllocator,
+    s: str.StringView
+) str.StringView = trust {
+    val b: mut ABuf = abuf_new(ar)
+    html_escape(ar, @addr(b), s)
+    return abuf_view(@addr(b))
+}
+
+fn json_escape(
+    ar: allocators.ScopedArenaAllocator,
+    b: mut ref ABuf,
+    s: str.StringView
+) void = trust {
+    val hex: str.StringView = "0123456789abcdef"
+    val i: mut i64 = 0
+    val start: mut i64 = 0
+    for {
+        if i >= s.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s.ptr, i))
+        val needs: bool = c < 32 || c == 34 || c == 92
+        if needs {
+            if i > start {
+                abuf_append(ar, b, str.slice(s, start, i))
+            }
+            if c == 34 {
+                abuf_append(ar, b, "\\\"")
+            } elif c == 92 {
+                abuf_append(ar, b, "\\\\")
+            } elif c == 10 {
+                abuf_append(ar, b, "\\n")
+            } elif c == 13 {
+                abuf_append(ar, b, "\\r")
+            } elif c == 9 {
+                abuf_append(ar, b, "\\t")
+            } else {
+                abuf_append(ar, b, "\\u00")
+                abuf_append_char(ar, b, @load8(@ptradd(hex.ptr, (c >> 4) as i64)))
+                abuf_append_char(ar, b, @load8(@ptradd(hex.ptr, (c & 15) as i64)))
+            }
+            start = i + 1
+        }
+        i++
+    }
+    if start < s.len {
+        abuf_append(ar, b, str.slice(s, start, s.len))
+    }
+}
+
+pub fn json_escape_buf(
+    ar: allocators.ScopedArenaAllocator,
+    s: str.StringView
+) str.StringView = trust {
+    val b: mut ABuf = abuf_new(ar)
+    json_escape(ar, @addr(b), s)
+    return abuf_view(@addr(b))
+}
+
+pub fn alloc_view(
+    ar: allocators.ScopedArenaAllocator,
+    s: str.StringView
+) str.StringView = trust {
+    if s.len <= 0 {
+        return ""
+    }
+    val raw: ref void = allocators.ScopedArena.alloc_or_none(ar, (s.len + 1) as usize)
+    if raw == none {
+        return ""
+    }
+    val out: ref u8 = raw as ref u8
+    @memcpy(out as ref void, s.ptr as ref void, s.len as usize)
+    @store8(@ptradd(out, s.len), 0)
+    return str.view(out, s.len)
+}
+
+pub fn alloc_cstr_view(
+    ar: allocators.ScopedArenaAllocator,
+    s: ref u8
+) str.StringView = trust {
+    return alloc_view(ar, str.from_cstr(s))
+}
+
+pub fn view_concat3(
+    ar: allocators.ScopedArenaAllocator,
+    a: str.StringView,
+    b: str.StringView,
+    c: str.StringView
+) str.StringView = trust {
+    val out: mut ABuf = abuf_new(ar)
+    abuf_append(ar, @addr(out), a)
+    abuf_append(ar, @addr(out), b)
+    abuf_append(ar, @addr(out), c)
+    return abuf_view(@addr(out))
+}
+
+pub fn read_file(
+    ar: allocators.ScopedArenaAllocator,
+    path: str.StringView
+) option[str.StringView] = trust {
+    match fs.read_all_heap(path) {
+        some raw => {
+            val n: i64 = @strlen(raw)
+            val out: ref void = allocators.ScopedArena.alloc_or_none(ar, (n + 1) as usize)
+            if out == none {
+                @free(raw as ref void)
+                return none
+            }
+            val buf: ref u8 = out as ref u8
+            if n > 0 {
+                @memcpy(buf as ref void, raw as ref void, n as usize)
+            }
+            @store8(@ptradd(buf, n), 0)
+            @free(raw as ref void)
+            return some str.view(buf, n)
+        }
+        none => {
+            return none
+        }
+    }
+}
+
+pub fn write_file(path: str.StringView, data: str.StringView) bool = trust {
+    return fs.write_all(path, data)
+}
+
+/// Create a directory and any missing parents.
+pub fn mkdir_p(path: str.StringView) bool = trust {
+    if path.len == 0 {
+        return false
+    }
+    if fs.is_directory(path) {
+        return true
+    }
+    val parent: str.StringView = view_dir(path)
+    if parent.len > 0 && !fs.is_directory(parent) {
+        if !mkdir_p(parent) {
+            return false
+        }
+    }
+    if fs.mkdir_path(path) {
+        return true
+    }
+    return fs.is_directory(path)
+}
+
+pub fn file_exists(path: str.StringView) bool = trust {
+    match fs.file_size(path) {
+        some _ => {
+            return true
+        }
+        none => {
+            return false
+        }
+    }
+}
+
+pub fn path_join(
+    ar: allocators.ScopedArenaAllocator,
+    dir: str.StringView,
+    name: str.StringView
+) str.StringView = trust {
+    if dir.len == 0 {
+        return alloc_view(ar, name)
+    }
+    if name.len == 0 {
+        return alloc_view(ar, dir)
+    }
+    if @load8(name.ptr) == 47 {
+        return alloc_view(ar, name)
+    }
+    return view_concat3(ar, dir, "/", name)
+}
+
+pub fn view_dir(path: str.StringView) str.StringView = trust {
+    val i: mut i64 = path.len - 1
+    for {
+        if i < 0 {
+            break
+        }
+        if @load8(@ptradd(path.ptr, i)) == 47 {
+            return str.slice(path, 0, i)
+        }
+        i--
+    }
+    return ""
+}
+
+pub fn view_base(path: str.StringView) str.StringView = trust {
+    val i: mut i64 = path.len - 1
+    for {
+        if i < 0 {
+            break
+        }
+        if @load8(@ptradd(path.ptr, i)) == 47 {
+            return str.slice(path, i + 1, path.len)
+        }
+        i--
+    }
+    return path
+}
+
+pub fn view_ext(path: str.StringView) str.StringView = trust {
+    val base: str.StringView = view_base(path)
+    val i: mut i64 = base.len - 1
+    for {
+        if i < 0 {
+            break
+        }
+        if @load8(@ptradd(base.ptr, i)) == 46 {
+            return str.slice(base, i, base.len)
+        }
+        i--
+    }
+    return ""
+}
+
+pub fn view_stem(path: str.StringView) str.StringView = trust {
+    val base: str.StringView = view_base(path)
+    val i: mut i64 = base.len - 1
+    for {
+        if i < 0 {
+            break
+        }
+        if @load8(@ptradd(base.ptr, i)) == 46 {
+            return str.slice(base, 0, i)
+        }
+        i--
+    }
+    return base
+}
+
+pub fn eql_cstr(v: str.StringView, s: ref u8) bool = trust {
+    return str.eql(v, str.from_cstr(s))
+}
+
+pub fn starts_with_cstr(v: str.StringView, s: ref u8) bool = trust {
+    return str.starts_with(v, str.from_cstr(s))
+}
+
+pub fn ends_with_cstr(v: str.StringView, s: ref u8) bool = trust {
+    return str.ends_with(v, str.from_cstr(s))
+}
+
+/// Normalize a relative path: collapse `.`, `..`, and repeated slashes.
+pub fn normalize_rel(
+    ar: allocators.ScopedArenaAllocator,
+    path: str.StringView
+) str.StringView = trust {
+    val out: mut ABuf = abuf_new(ar)
+    val i: mut i64 = 0
+    for {
+        if i >= path.len {
+            break
+        }
+        for {
+            if i >= path.len {
+                break
+            }
+            if @load8(@ptradd(path.ptr, i)) != 47 {
+                break
+            }
+            i++
+        }
+        if i >= path.len {
+            break
+        }
+        val start: i64 = i
+        for {
+            if i >= path.len {
+                break
+            }
+            if @load8(@ptradd(path.ptr, i)) == 47 {
+                break
+            }
+            i++
+        }
+        val seg: str.StringView = str.slice(path, start, i)
+        if str.eql(seg, "..") {
+            pop_segment(@addr(out))
+        } elif str.eql(seg, ".") || seg.len == 0 {
+            // skip
+        } else {
+            if out.len > 0 {
+                abuf_append_char(ar, @addr(out), 47)
+            }
+            abuf_append(ar, @addr(out), seg)
+        }
+    }
+    return abuf_view(@addr(out))
+}
+
+fn pop_segment(b: mut ref ABuf) void = trust {
+    if b.len <= 0 {
+        return
+    }
+    val i: mut i64 = b.len - 1
+    for {
+        if i < 0 {
+            break
+        }
+        if @load8(@ptradd(b.ptr, i)) == 47 {
+            b.len = i
+            @store8(@ptradd(b.ptr, b.len), 0)
+            return
+        }
+        i--
+    }
+    b.len = 0
+    @store8(b.ptr, 0)
+}
+
+pub fn path_lower_ext_is(path: str.StringView, ext: ref u8) bool = trust {
+    val e: str.StringView = view_ext(path)
+    if e.len != @strlen(ext) {
+        return false
+    }
+    val i: mut i64 = 0
+    for {
+        if i >= e.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(e.ptr, i))
+        val lower: mut u8 = c
+        if c >= 65 && c <= 90 {
+            lower = (c + 32) as u8
+        }
+        if lower != @load8(@ptradd(ext, i)) {
+            return false
+        }
+        i++
+    }
+    return true
+}
+
+pub fn slugify(
+    ar: allocators.ScopedArenaAllocator,
+    text: str.StringView
+) str.StringView = trust {
+    val out: mut ABuf = abuf_new(ar)
+    val i: mut i64 = 0
+    val last_dash: mut bool = false
+    for {
+        if i >= text.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(text.ptr, i))
+        val keep: mut bool = false
+        val lower: mut u8 = c
+        if c >= 65 && c <= 90 {
+            lower = (c + 32) as u8
+            keep = true
+        } elif (c >= 97 && c <= 122) || (c >= 48 && c <= 57) {
+            keep = true
+        }
+        if keep {
+            abuf_append_char(ar, @addr(out), lower)
+            last_dash = false
+        } elif !last_dash && out.len > 0 {
+            abuf_append_char(ar, @addr(out), 45)
+            last_dash = true
+        }
+        i++
+    }
+    for {
+        if out.len <= 0 {
+            break
+        }
+        if @load8(@ptradd(out.ptr, out.len - 1)) != 45 {
+            break
+        }
+        out.len = out.len - 1
+        @store8(@ptradd(out.ptr, out.len), 0)
+    }
+    if out.len == 0 {
+        abuf_append(ar, @addr(out), "section")
+    }
+    return abuf_view(@addr(out))
+}
+
+/// Turn a file or directory name into a readable title.
+pub fn prettify_name(
+    ar: allocators.ScopedArenaAllocator,
+    name: str.StringView
+) str.StringView = trust {
+    val out: mut ABuf = abuf_new(ar)
+    val i: mut i64 = 0
+    val capitalize: mut bool = true
+    for {
+        if i >= name.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(name.ptr, i))
+        if c == 45 || c == 95 {
+            abuf_append_char(ar, @addr(out), 32)
+            capitalize = true
+        } else {
+            val emit: mut u8 = c
+            if capitalize && c >= 97 && c <= 122 {
+                emit = (c - 32) as u8
+            }
+            abuf_append_char(ar, @addr(out), emit)
+            capitalize = false
+        }
+        i++
+    }
+    return abuf_view(@addr(out))
+}
+
+pub fn url_encode_path(
+    ar: allocators.ScopedArenaAllocator,
+    path: str.StringView
+) str.StringView = trust {
+    val hex: str.StringView = "0123456789ABCDEF"
+    val out: mut ABuf = abuf_new(ar)
+    val i: mut i64 = 0
+    for {
+        if i >= path.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(path.ptr, i))
+        val safe: bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) ||
+        (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 46 || c == 126 || c == 47
+        if safe {
+            abuf_append_char(ar, @addr(out), c)
+        } else {
+            abuf_append_char(ar, @addr(out), 37)
+            abuf_append_char(ar, @addr(out), @load8(@ptradd(hex.ptr, (c >> 4) as i64)))
+            abuf_append_char(ar, @addr(out), @load8(@ptradd(hex.ptr, (c & 15) as i64)))
+        }
+        i++
+    }
+    return abuf_view(@addr(out))
+}
+
+pub fn url_decode(
+    ar: allocators.ScopedArenaAllocator,
+    path: str.StringView
+) str.StringView = trust {
+    val out: mut ABuf = abuf_new(ar)
+    val i: mut i64 = 0
+    for {
+        if i >= path.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(path.ptr, i))
+        if c == 37 && i + 2 < path.len {
+            val hi: i64 = hex_value(@load8(@ptradd(path.ptr, i + 1)))
+            val lo: i64 = hex_value(@load8(@ptradd(path.ptr, i + 2)))
+            if hi >= 0 && lo >= 0 {
+                abuf_append_char(ar, @addr(out), ((hi << 4) | lo) as u8)
+                i = i + 3
+                continue
+            }
+        }
+        abuf_append_char(ar, @addr(out), c)
+        i++
+    }
+    return abuf_view(@addr(out))
+}
+
+fn hex_value(c: u8) i64 = {
+    if c >= 48 && c <= 57 {
+        return (c - 48) as i64
+    }
+    if c >= 65 && c <= 70 {
+        return (c - 55) as i64
+    }
+    if c >= 97 && c <= 102 {
+        return (c - 87) as i64
+    }
+    return -1
+}
+
+pub fn trim_view(s: str.StringView) str.StringView = trust {
+    return str.trim(s)
+}
+
+pub fn list_len(l: list[str.StringView]) i64 = {
+    return @len(l) as i64
+}

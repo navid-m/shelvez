@@ -1,0 +1,10 @@
+/// Numeric error codes shared by the command modules.
+
+pub val E_CONFIG_MISSING: i64 = 1
+pub val E_CONFIG_INVALID: i64 = 2
+pub val E_CONTENT_MISSING: i64 = 3
+pub val E_PAGE_MISSING: i64 = 4
+pub val E_OUT_OF_MEMORY: i64 = 5
+pub val E_OUTPUT: i64 = 6
+pub val E_BUILD: i64 = 7
+pub val E_LISTEN: i64 = 8

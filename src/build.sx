@@ -1,0 +1,466 @@
+/// Site rendering and static output.
+
+val allocators = use("std/allocators")
+val config     = use("config.sx")
+val errors     = use("errors.sx")
+val fs         = use("std/fs")
+val markdown   = use("markdown.sx")
+val page       = use("page.sx")
+val stdio      = use("std/stdio")
+val str        = use("std/string")
+val tree       = use("tree.sx")
+val util       = use("sxutil.sx")
+
+pub type Site = {
+    cfg: config.Config
+    nav: ref tree.NavNode
+    pages: list[ref tree.Page]
+}
+
+pub type Workspace = {
+    arena: mut allocators.ScopedArenaAllocator
+    la: mut allocators.ListArena
+    site: mut Site
+    sig: mut u64
+}
+
+pub type BuildStats = {
+    pages: i64
+    assets: i64
+}
+
+pub fn prepare_site(
+    ar: allocators.ScopedArenaAllocator,
+    la: allocators.ListArena,
+    root: str.StringView
+) result[Site, i64] = trust {
+    val cfg: mut config.Config = @zeroed
+    match config.load_config(ar, la, root) {
+        ok value => {
+            cfg = value
+        }
+        err code => {
+            return err code
+        }
+    }
+    val built: mut tree.Tree = @zeroed
+    match tree.build_tree(ar, la, cfg) {
+        ok value => {
+            built = value
+        }
+        err code => {
+            return err code
+        }
+    }
+    val n: i64 = @len(built.pages) as i64
+    val i: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        if @get(built.pages, i as usize) is some item {
+            match markdown.render(ar, la, item.body, item.rel) {
+                ok rendered => {
+                    item.body_html = rendered.html
+                    item.toc = rendered.toc
+                }
+                err _ => {
+                    return err errors.E_OUT_OF_MEMORY
+                }
+            }
+        }
+        i++
+    }
+    return ok Site{cfg: cfg, nav: built.root, pages: built.pages}
+}
+
+pub fn create_workspace(
+    root: str.StringView
+) result[ref Workspace, i64] = trust {
+    val arena_opt = allocators.ScopedArena.new(262144 as usize)
+    val arena: mut allocators.ScopedArenaAllocator = none
+    match arena_opt {
+        ok a => {
+            arena = a
+        }
+        err _ => {
+            return err errors.E_OUT_OF_MEMORY
+        }
+    }
+    val la: allocators.ListArena = {arena: arena}
+    val site: mut Site = @zeroed
+    match prepare_site(arena, la, root) {
+        ok value => {
+            site = value
+        }
+        err e => {
+            allocators.ScopedArena.free(arena)
+            return err e
+        }
+    }
+    val ws: mut ref Workspace = @alloc(@sizeof(Workspace) as usize) as ref Workspace
+    if ws == none {
+        allocators.ScopedArena.free(arena)
+        return err errors.E_OUT_OF_MEMORY
+    }
+    ws.arena = arena
+    ws.la = la
+    ws.site = site
+    ws.sig = 0
+    return ok ws
+}
+
+pub fn workspace_free(ws: ref Workspace) void = trust {
+    allocators.ScopedArena.free(ws.arena)
+    @free(ws as ref void)
+}
+
+/// Rebuild a workspace into fresh arenas, preserving the old site if the build fails.
+pub fn workspace_reload(ws: mut ref Workspace, root: str.StringView) bool = trust {
+    val arena_opt = allocators.ScopedArena.new(262144 as usize)
+    val arena: mut allocators.ScopedArenaAllocator = none
+    match arena_opt {
+        ok a => {
+            arena = a
+        }
+        err _ => {
+            return false
+        }
+    }
+    val la: allocators.ListArena = {arena: arena}
+    val site: mut Site = @zeroed
+    match prepare_site(arena, la, root) {
+        ok value => {
+            site = value
+        }
+        err _ => {
+            allocators.ScopedArena.free(arena)
+            return false
+        }
+    }
+    val old_arena: allocators.ScopedArenaAllocator = ws.arena
+    ws.arena = arena
+    ws.la = la
+    ws.site = site
+    allocators.ScopedArena.free(old_arena)
+    return true
+}
+
+fn file_hash(path: str.StringView, seed: u64) u64 = trust {
+    val size_opt = fs.file_size(path)
+    val size: mut i64 = 0
+    match size_opt {
+        some value => {
+            size = value
+        }
+        none => {
+            return seed
+        }
+    }
+    val hash: mut u64 = seed
+    hash = (hash ^ (size as u64)) * (1099511628211 as u64)
+    val data = fs.read_all_heap(path)
+    if data is some raw {
+        val i: mut i64 = 0
+        for {
+            if i >= size {
+                break
+            }
+            hash = (hash ^ (@load8(@ptradd(raw, i)) as u64)) * (1099511628211 as u64)
+            i++
+        }
+        @free(raw as ref void)
+    }
+    return hash
+}
+
+fn hash_tree(
+    ar: allocators.ScopedArenaAllocator,
+    la: allocators.ListArena,
+    dir: str.StringView,
+    hash_in: u64
+) u64 = trust {
+    val hash: mut u64 = hash_in
+    val zpath: str.ZString = str.zstr_from[allocators.ListArena](la, dir)
+    if zpath.ptr == none {
+        return hash
+    }
+    val entries = fs.walk_dir[allocators.ListArena](la, zpath.ptr)
+    if entries is some names {
+        val n: i64 = @len(names) as i64
+        val i: mut i64 = 0
+        for {
+            if i >= n {
+                break
+            }
+            if @get(names, i as usize) is some entry {
+                val name: str.StringView = str.from_cstr(entry)
+                val hidden: bool = name.len > 0 && @load8(name.ptr) == 46
+                if !hidden {
+                    val child: str.StringView = util.path_join(ar, dir, name)
+                    if fs.is_directory(child) {
+                        hash = hash_tree(ar, la, child, hash)
+                    } else {
+                        val j: mut i64 = 0
+                        for {
+                            if j >= name.len {
+                                break
+                            }
+                            hash = (hash ^ (@load8(@ptradd(name.ptr, j)) as u64)) *
+                            (1099511628211 as u64)
+                            j++
+                        }
+                        hash = file_hash(child, hash)
+                    }
+                }
+            }
+            i++
+        }
+    }
+    return hash
+}
+
+pub fn signature(
+    ar: allocators.ScopedArenaAllocator,
+    la: allocators.ListArena,
+    cfg: config.Config
+) u64 = trust {
+    val hash: mut u64 = 1469598103934665603
+    val index_path: str.StringView = util.path_join(ar, cfg.root, "index.json")
+    hash = file_hash(index_path, hash)
+    val content: str.StringView = util.path_join(ar, cfg.root, cfg.content)
+    hash = hash_tree(ar, la, content, hash)
+    return hash
+}
+
+fn confirm_overwrite() bool = trust {
+    stdio.eputs("dist/ already exists. Rebuilding will delete its contents.\nOverwrite? [y/N] ")
+    val buf: ref u8 = @alloc(64) as ref u8
+    if buf == none {
+        return false
+    }
+    @store8(buf, 0)
+    val line = stdio.read_line(buf, 64)
+    val yes: mut bool = false
+    if line != none {
+        val first: u8 = @load8(buf)
+        if first == 121 || first == 89 {
+            yes = true
+        }
+    }
+    @free(buf as ref void)
+    return yes
+}
+
+fn write_page(
+    ar: allocators.ScopedArenaAllocator,
+    dist: str.StringView,
+    item: ref tree.Page,
+    html: str.StringView
+) bool = trust {
+    val out_path: str.StringView = util.path_join(ar, dist, item.out_rel)
+    val dir: str.StringView = util.path_join(ar, dist, util.view_dir(item.out_rel))
+    if util.view_dir(item.out_rel).len > 0 {
+        util.mkdir_p(dir)
+    }
+    return util.write_file(out_path, html)
+}
+
+fn write_home_redirect(
+    ar: allocators.ScopedArenaAllocator,
+    dist: str.StringView,
+    target: str.StringView
+) bool = trust {
+    val b: mut util.ABuf = util.abuf_new(ar)
+    util.abuf_append(ar, @addr(b),
+        \\<!DOCTYPE html>
+        \\<html lang="en">
+        \\<head>
+        \\<meta charset="utf-8">
+        \\<meta http-equiv="refresh" content="0; url=
+    )
+    util.abuf_append(ar, @addr(b), target)
+    util.abuf_append(ar, @addr(b),
+        \\">
+        \\<title>Redirecting</title>
+        \\</head>
+        \\<body>
+        \\<p>Redirecting to <a href="
+    )
+    util.abuf_append(ar, @addr(b), target)
+    util.abuf_append(ar, @addr(b),
+        \\">the first page</a>.</p>
+        \\</body>
+        \\</html>
+    )
+    return util.write_file(util.path_join(ar, dist, "index.html"), util.abuf_view(@addr(b)))
+}
+
+fn copy_assets(
+    ar: allocators.ScopedArenaAllocator,
+    la: allocators.ListArena,
+    src_dir: str.StringView,
+    dst_dir: str.StringView
+) i64 = trust {
+    val copied: mut i64 = 0
+    val zpath: str.ZString = str.zstr_from[allocators.ListArena](la, src_dir)
+    if zpath.ptr == none {
+        return 0
+    }
+    val entries = fs.walk_dir[allocators.ListArena](la, zpath.ptr)
+    if entries is some names {
+        val n: i64 = @len(names) as i64
+        val i: mut i64 = 0
+        for {
+            if i >= n {
+                break
+            }
+            if @get(names, i as usize) is some entry {
+                val name: str.StringView = str.from_cstr(entry)
+                val hidden: bool = name.len > 0 && @load8(name.ptr) == 46
+                val ignored: bool = hidden || str.eql(name, "dist") ||
+                str.eql(name, "node_modules") || str.eql(name, ".sxb")
+                if !ignored {
+                    val src: str.StringView = util.path_join(ar, src_dir, name)
+                    val dst: str.StringView = util.path_join(ar, dst_dir, name)
+                    if fs.is_directory(src) {
+                        util.mkdir_p(dst)
+                        copied = copied + copy_assets(ar, la, src, dst)
+                    } elif !util.path_lower_ext_is(name, c".md") &&
+                    !util.path_lower_ext_is(name, c".markdown") {
+                        val size_opt = fs.file_size(src)
+                        val data = fs.read_all_heap(src)
+                        val size: mut i64 = 0
+                        if size_opt is some value {
+                            size = value
+                        }
+                        if data is some raw {
+                            if fs.write_all_bytes(dst, raw as ref void, size) {
+                                copied++
+                            }
+                            @free(raw as ref void)
+                        }
+                    }
+                }
+            }
+            i++
+        }
+    }
+    return copied
+}
+
+pub fn build(
+    root: str.StringView,
+    force: bool
+) result[BuildStats, i64] = trust {
+    val ws: mut ref Workspace = none
+    match create_workspace(root) {
+        ok value => {
+            ws = value
+        }
+        err e => {
+            return err e
+        }
+    }
+    val dist: str.StringView = util.path_join(ws.arena, root, "dist")
+    if fs.is_directory(dist) || util.file_exists(dist) {
+        val proceed: mut bool = force
+        if !force {
+            proceed = confirm_overwrite()
+        }
+        if !proceed {
+            workspace_free(ws)
+            stdio.puts("Build cancelled.")
+            return ok BuildStats{pages: 0, assets: 0}
+        }
+        if fs.is_directory(dist) {
+            fs.remove_dir_all(dist)
+        } else {
+            fs.delete(dist)
+        }
+    }
+    if !util.mkdir_p(dist) {
+        workspace_free(ws)
+        return err errors.E_OUTPUT
+    }
+    val failed: mut bool = false
+    val content_dir: str.StringView = util.path_join(
+        ws.arena,
+        root,
+        ws.site.cfg.content
+    )
+    val assets_copied: i64 = copy_assets(ws.arena, ws.la, content_dir, dist)
+    val assets_dir: str.StringView = util.path_join(ws.arena, dist, "assets")
+    util.mkdir_p(assets_dir)
+    if !util.write_file(util.path_join(ws.arena, assets_dir, "style.css"), page.asset_css()) {
+        failed = true
+    }
+    if !util.write_file(util.path_join(ws.arena, assets_dir, "shelvez.js"), page.asset_js()) {
+        failed = true
+    }
+    if !util.write_file(
+        util.path_join(ws.arena, assets_dir, "search.json"),
+        page.build_search_json(ws.arena, ws.site.pages)
+    ) {
+        failed = true
+    }
+    if !util.write_file(
+        util.path_join(ws.arena, assets_dir, "favicon.svg"),
+        page.asset_favicon()
+    ) {
+        failed = true
+    }
+    if !util.write_file(
+        util.path_join(ws.arena, assets_dir, "theme.js"),
+        page.asset_theme()
+    ) {
+        failed = true
+    }
+    val pages_written: mut i64 = 0
+    val n: i64 = @len(ws.site.pages) as i64
+    val i: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        if @get(ws.site.pages, i as usize) is some item {
+            val html: str.StringView = page.render_page(
+                ws.arena,
+                ws.la,
+                ws.site.cfg,
+                ws.site.nav,
+                ws.site.pages,
+                item,
+                false,
+                0
+            )
+            if write_page(ws.arena, dist, item, html) {
+                pages_written++
+            } else {
+                failed = true
+            }
+        }
+        i++
+    }
+    if !util.write_file(
+        util.path_join(ws.arena, dist, "404.html"),
+        page.render_404(ws.arena, ws.site.cfg)
+    ) {
+        failed = true
+    }
+    val home: str.StringView = page.home_url(ws.site.pages)
+    if !str.eql(home, "/") {
+        if !write_home_redirect(ws.arena, dist, home) {
+            failed = true
+        }
+    }
+    val stats: BuildStats = BuildStats{
+        pages: pages_written,
+        assets: assets_copied
+    }
+    workspace_free(ws)
+    if failed {
+        return err errors.E_OUTPUT
+    }
+    return ok stats
+}

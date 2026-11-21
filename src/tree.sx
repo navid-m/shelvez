@@ -1,0 +1,661 @@
+/// Page discovery and navigation-tree construction.
+
+val allocators = use("std/allocators")
+val config     = use("config.sx")
+val errors     = use("errors.sx")
+val fs         = use("std/fs")
+val str        = use("std/string")
+val util       = use("sxutil.sx")
+
+pub type NavNode = {
+    title: mut str.StringView
+    url: mut str.StringView
+    path: mut str.StringView
+    parent: mut ref NavNode
+    children: mut list[ref NavNode]
+}
+
+pub type Page = {
+    title: mut str.StringView
+    description: mut str.StringView
+    url: mut str.StringView
+    rel: mut str.StringView
+    out_rel: mut str.StringView
+    source: mut str.StringView
+    body: mut str.StringView
+    body_html: mut str.StringView
+    html: mut str.StringView
+    toc: mut str.StringView
+    nav: mut ref NavNode
+    is_home: mut bool
+}
+
+pub type Tree = {
+    root: mut ref NavNode
+    pages: mut list[ref Page]
+}
+
+pub type DocMeta = {
+    title: mut str.StringView
+    description: mut str.StringView
+    body: mut str.StringView
+    explicit_title: mut bool
+}
+
+fn nav_children(la: allocators.ListArena) option[list[ref NavNode]] = trust {
+    match @listalloc[allocators.ListArena, ref NavNode](la) {
+        ok l => {
+            return some l
+        }
+        err _ => {
+            return none
+        }
+    }
+}
+
+fn page_list(la: allocators.ListArena) option[list[ref Page]] = trust {
+    match @listalloc[allocators.ListArena, ref Page](la) {
+        ok l => {
+            return some l
+        }
+        err _ => {
+            return none
+        }
+    }
+}
+
+fn new_nav(
+    ar: allocators.ScopedArenaAllocator,
+    la: allocators.ListArena
+) mut ref NavNode = trust {
+    val node: mut ref NavNode = allocators.ScopedArena.alloc_or_none(
+        ar,
+        @sizeof(NavNode) as usize
+    ) as ref NavNode
+    if node == none {
+        return none
+    }
+    node.title = ""
+    node.url = ""
+    node.path = ""
+    node.parent = none
+    match nav_children(la) {
+        some children => {
+            node.children = children
+        }
+        none => {
+            return none
+        }
+    }
+    return node
+}
+
+fn line_end(s: str.StringView, start: i64) i64 = trust {
+    val i: mut i64 = start
+    for {
+        if i >= s.len {
+            break
+        }
+        if @load8(@ptradd(s.ptr, i)) == 10 {
+            break
+        }
+        i++
+    }
+    return i
+}
+
+fn strip_cr(s: str.StringView) str.StringView = trust {
+    if s.len > 0 && @load8(@ptradd(s.ptr, s.len - 1)) == 13 {
+        return str.slice(s, 0, s.len - 1)
+    }
+    return s
+}
+
+fn clean_heading(s: str.StringView) str.StringView = trust {
+    val t: str.StringView = str.trim(s)
+    val end: mut i64 = t.len
+    for {
+        if end <= 0 {
+            break
+        }
+        if @load8(@ptradd(t.ptr, end - 1)) != 35 {
+            break
+        }
+        end--
+    }
+    return str.trim(str.slice(t, 0, end))
+}
+
+fn unquote(s: str.StringView) str.StringView = trust {
+    val t: str.StringView = str.trim(s)
+    if t.len >= 2 {
+        val a: u8 = @load8(t.ptr)
+        val b: u8 = @load8(@ptradd(t.ptr, t.len - 1))
+        if (a == 34 && b == 34) || (a == 39 && b == 39) {
+            return str.slice(t, 1, t.len - 1)
+        }
+    }
+    return t
+}
+
+fn key_value(line: str.StringView, key: ref u8) option[str.StringView] = trust {
+    val t: str.StringView = str.trim(line)
+    val klen: i64 = @strlen(key)
+    if t.len <= klen {
+        return none
+    }
+    if !str.starts_with(t, str.from_cstr(key)) {
+        return none
+    }
+    if @load8(@ptradd(t.ptr, klen)) != 58 {
+        return none
+    }
+    return some str.trim(str.slice(t, klen + 1, t.len))
+}
+
+/// Extract optional front matter and a leading H1 from a markdown document.
+pub fn parse_meta(
+    ar: allocators.ScopedArenaAllocator,
+    raw: str.StringView,
+    fallback_title: str.StringView
+) DocMeta = trust {
+    val meta: mut DocMeta = @zeroed
+    meta.title = util.alloc_view(ar, fallback_title)
+    meta.description = ""
+    meta.body = raw
+    meta.explicit_title = false
+    val first_end: i64 = line_end(raw, 0)
+    val first: str.StringView = strip_cr(str.slice(raw, 0, first_end))
+    if str.eql(str.trim(first), "---") {
+        val i: mut i64 = first_end
+        if i < raw.len {
+            i++
+        }
+        val body_start: mut i64 = raw.len
+        val closed: mut bool = false
+        for {
+            if i >= raw.len {
+                break
+            }
+            val end: i64 = line_end(raw, i)
+            val line: str.StringView = strip_cr(str.slice(raw, i, end))
+            if str.eql(str.trim(line), "---") {
+                body_start = end
+                if body_start < raw.len {
+                    body_start++
+                }
+                closed = true
+                break
+            }
+            if key_value(line, c"title") is some v {
+                meta.title = util.alloc_view(ar, unquote(v))
+                meta.explicit_title = true
+            }
+            if key_value(line, c"description") is some v {
+                meta.description = util.alloc_view(ar, unquote(v))
+            }
+            i = end
+            if i < raw.len {
+                i++
+            }
+        }
+        if closed {
+            meta.body = str.slice(raw, body_start, raw.len)
+        } else {
+            meta.title = util.alloc_view(ar, fallback_title)
+            meta.description = ""
+            meta.explicit_title = false
+        }
+    }
+    val body: str.StringView = meta.body
+    val pos: mut i64 = 0
+    for {
+        if pos >= body.len {
+            break
+        }
+        val end: i64 = line_end(body, pos)
+        val line: str.StringView = strip_cr(str.slice(body, pos, end))
+        if str.trim(line).len == 0 {
+            pos = end
+            if pos < body.len {
+                pos++
+            }
+            continue
+        }
+        val t: str.StringView = str.trim(line)
+        if t.len >= 2 && @load8(t.ptr) == 35 && @load8(@ptradd(t.ptr, 1)) == 32 {
+            if !meta.explicit_title {
+                meta.title = util.alloc_view(ar, clean_heading(str.slice(t, 2, t.len)))
+            }
+            pos = end
+            if pos < body.len {
+                pos++
+            }
+            for {
+                if pos >= body.len {
+                    break
+                }
+                val e2: i64 = line_end(body, pos)
+                val l2: str.StringView = strip_cr(str.slice(body, pos, e2))
+                if str.trim(l2).len != 0 {
+                    break
+                }
+                pos = e2
+                if pos < body.len {
+                    pos++
+                }
+            }
+            meta.body = str.slice(body, pos, body.len)
+        }
+        break
+    }
+    return meta
+}
+
+pub fn url_for_rel(
+    ar: allocators.ScopedArenaAllocator,
+    rel: str.StringView
+) str.StringView = trust {
+    val norm: str.StringView = util.normalize_rel(ar, rel)
+    val stem_path: mut str.StringView = norm
+    if util.path_lower_ext_is(norm, c".md") || util.path_lower_ext_is(norm, c".markdown") {
+        stem_path = str.slice(norm, 0, norm.len - util.view_ext(norm).len)
+    }
+    val dir: str.StringView = util.view_dir(stem_path)
+    val base: str.StringView = util.view_base(stem_path)
+    val out: mut ABuf = util.abuf_new(ar)
+    if str.eql(base, "index") {
+        if dir.len == 0 {
+            util.abuf_append(ar, @addr(out), "/")
+        } else {
+            util.abuf_append(ar, @addr(out), "/")
+            util.abuf_append(ar, @addr(out), dir)
+            util.abuf_append(ar, @addr(out), "/")
+        }
+    } else {
+        util.abuf_append(ar, @addr(out), "/")
+        if dir.len > 0 {
+            util.abuf_append(ar, @addr(out), dir)
+            util.abuf_append(ar, @addr(out), "/")
+        }
+        util.abuf_append(ar, @addr(out), base)
+        util.abuf_append(ar, @addr(out), "/")
+    }
+    return util.url_encode_path(ar, util.abuf_view(@addr(out)))
+}
+
+pub fn out_rel_for_rel(
+    ar: allocators.ScopedArenaAllocator,
+    rel: str.StringView
+) str.StringView = trust {
+    val norm: str.StringView = util.normalize_rel(ar, rel)
+    val stem_path: mut str.StringView = norm
+    if util.path_lower_ext_is(norm, c".md") || util.path_lower_ext_is(norm, c".markdown") {
+        stem_path = str.slice(norm, 0, norm.len - util.view_ext(norm).len)
+    }
+    val dir: str.StringView = util.view_dir(stem_path)
+    val base: str.StringView = util.view_base(stem_path)
+    val out: mut ABuf = util.abuf_new(ar)
+    if str.eql(base, "index") {
+        if dir.len > 0 {
+            util.abuf_append(ar, @addr(out), dir)
+            util.abuf_append(ar, @addr(out), "/")
+        }
+        util.abuf_append(ar, @addr(out), "index.html")
+    } else {
+        if dir.len > 0 {
+            util.abuf_append(ar, @addr(out), dir)
+            util.abuf_append(ar, @addr(out), "/")
+        }
+        util.abuf_append(ar, @addr(out), base)
+        util.abuf_append(ar, @addr(out), "/index.html")
+    }
+    return util.abuf_view(@addr(out))
+}
+
+fn make_page(
+    ar: allocators.ScopedArenaAllocator,
+    cfg: config.Config,
+    nav: ref NavNode,
+    rel: str.StringView,
+    explicit_title: str.StringView
+) option[ref Page] = trust {
+    val full: str.StringView = util.path_join(ar, cfg.root, util.path_join(ar, cfg.content, rel))
+    val raw: mut str.StringView = ""
+    match util.read_file(ar, full) {
+        some text => {
+            raw = text
+        }
+        none => {
+            return none
+        }
+    }
+    val fallback: str.StringView = util.prettify_name(ar, util.view_stem(util.view_base(rel)))
+    val meta: DocMeta = parse_meta(ar, raw, fallback)
+    val page: mut ref Page = allocators.ScopedArena.alloc_or_none(
+        ar,
+        @sizeof(Page) as usize
+    ) as ref Page
+    if page == none {
+        return none
+    }
+    page.description = meta.description
+    page.rel = util.alloc_view(ar, rel)
+    page.source = full
+    page.body = meta.body
+    page.body_html = ""
+    page.html = ""
+    page.toc = ""
+    page.nav = nav
+    page.url = url_for_rel(ar, rel)
+    page.out_rel = out_rel_for_rel(ar, rel)
+    page.is_home = str.eql(page.url, "/")
+    if explicit_title.len > 0 {
+        page.title = explicit_title
+    } else {
+        page.title = meta.title
+    }
+    return some page
+}
+
+fn is_index_name(name: ref u8) bool = trust {
+    return @strcmp(name, c"index.md") == 0 || @strcmp(name, c"index.markdown") == 0
+}
+
+fn name_less(a: ref u8, b: ref u8) bool = trust {
+    val ai: bool = is_index_name(a)
+    val bi: bool = is_index_name(b)
+    if ai && !bi {
+        return true
+    }
+    if bi && !ai {
+        return false
+    }
+    return @strcmp(a, b) < 0
+}
+
+fn sort_names(names: mut list[ref u8]) void = trust {
+    val n: i64 = @len(names) as i64
+    val i: mut i64 = 1
+    for {
+        if i >= n {
+            break
+        }
+        val key: mut ref u8 = none
+        if @get(names, i as usize) is some v {
+            key = v
+        }
+        if key != none {
+            val key_ptr: ref u8 = key
+            val j: mut i64 = i - 1
+            for {
+                if j < 0 {
+                    break
+                }
+                match @get(names, j as usize) {
+                    some prev => {
+                        val prev_ptr: ref u8 = prev
+                        if !name_less(key_ptr, prev_ptr) {
+                            break
+                        }
+                        @set(names, (j + 1) as usize, prev_ptr)
+                    }
+                    none => {
+                        break
+                    }
+                }
+                j--
+            }
+            @set(names, (j + 1) as usize, key_ptr)
+        }
+        i++
+    }
+}
+
+fn scan_dir(
+    ar: allocators.ScopedArenaAllocator,
+    la: allocators.ListArena,
+    cfg: config.Config,
+    abs_dir: str.StringView,
+    rel_dir: str.StringView,
+    parent: ref NavNode,
+    pages: mut list[ref Page]
+) option[ref NavNode] = trust {
+    val section: mut ref NavNode = new_nav(ar, la)
+    if section == none {
+        return none
+    }
+    if rel_dir.len == 0 {
+        section.title = cfg.title
+    } else {
+        section.title = util.prettify_name(ar, util.view_base(rel_dir))
+    }
+    section.path = ""
+    section.url = ""
+    section.parent = parent
+    val zpath: str.ZString = str.zstr_from[allocators.ListArena](la, abs_dir)
+    if zpath.ptr == none {
+        return none
+    }
+    val entries = fs.walk_dir[allocators.ListArena](la, zpath.ptr)
+    match entries {
+        none => {
+            return none
+        }
+        some names => {
+            sort_names(names)
+            val n: i64 = @len(names) as i64
+            val i: mut i64 = 0
+            for {
+                if i >= n {
+                    break
+                }
+                if @get(names, i as usize) is some entry {
+                    val name: str.StringView = str.from_cstr(entry)
+                    val hidden: bool = name.len > 0 && @load8(name.ptr) == 46
+                    if !hidden {
+                        val abs_child: str.StringView = util.path_join(ar, abs_dir, name)
+                        val rel_child: str.StringView = util.path_join(ar, rel_dir, name)
+                        if fs.is_directory(abs_child) {
+                            match scan_dir(ar, la, cfg, abs_child, rel_child, section, pages) {
+                                some sub => {
+                                    if @len(sub.children) > 0 {
+                                        @append(section.children, sub)
+                                    }
+                                }
+                                none => {
+                                    return none
+                                }
+                            }
+                        } elif util.path_lower_ext_is(
+                            name,
+                            c".md"
+                        ) || util.path_lower_ext_is(name, c".markdown") {
+                            val fallback: str.StringView = util.prettify_name(
+                                ar,
+                                util.view_stem(name)
+                            )
+                            val page_nav: mut ref NavNode = new_nav(ar, la)
+                            if page_nav == none {
+                                return none
+                            }
+                            page_nav.title = fallback
+                            page_nav.path = util.alloc_view(ar, rel_child)
+                            page_nav.url = url_for_rel(ar, rel_child)
+                            page_nav.parent = section
+                            match make_page(ar, cfg, page_nav, rel_child, "") {
+                                some page => {
+                                    page_nav.title = page.title
+                                    @append(section.children, page_nav)
+                                    @append(pages, page)
+                                }
+                                none => {
+                                    return none
+                                }
+                            }
+                        }
+                    }
+                }
+                i++
+            }
+        }
+    }
+    return some section
+}
+
+fn build_explicit_node(
+    ar: allocators.ScopedArenaAllocator,
+    la: allocators.ListArena,
+    cfg: config.Config,
+    entry: ref config.NavSpec,
+    parent: ref NavNode,
+    pages: mut list[ref Page]
+) option[ref NavNode] = trust {
+    val node: mut ref NavNode = new_nav(ar, la)
+    if node == none {
+        return none
+    }
+    node.title = entry.title
+    node.parent = parent
+    if entry.path.len > 0 {
+        val rel: str.StringView = util.normalize_rel(ar, entry.path)
+        node.path = util.alloc_view(ar, rel)
+        node.url = url_for_rel(ar, rel)
+        val explicit: mut str.StringView = ""
+        if entry.title.len > 0 {
+            val derived: str.StringView = util.prettify_name(
+                ar,
+                util.view_stem(util.view_base(rel))
+            )
+            if !str.eql(entry.title, derived) {
+                explicit = entry.title
+            }
+        }
+        match make_page(ar, cfg, node, rel, explicit) {
+            some page => {
+                node.title = page.title
+                @append(pages, page)
+            }
+            none => {
+                return none
+            }
+        }
+    }
+    val n: i64 = @len(entry.children) as i64
+    val i: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        if @get(entry.children, i as usize) is some child_spec {
+            match build_explicit_node(ar, la, cfg, child_spec, node, pages) {
+                some child => {
+                    @append(node.children, child)
+                }
+                none => {
+                    return none
+                }
+            }
+        }
+        i++
+    }
+    if node.path.len == 0 && node.title.len == 0 {
+        node.title = "Section"
+    }
+    return some node
+}
+
+pub fn build_tree(
+    ar: allocators.ScopedArenaAllocator,
+    la: allocators.ListArena,
+    cfg: config.Config
+) result[Tree, i64] = trust {
+    val content_abs: str.StringView = util.path_join(ar, cfg.root, cfg.content)
+    if !fs.is_directory(content_abs) {
+        return err errors.E_CONTENT_MISSING
+    }
+    match page_list(la) {
+        some pages => {
+            if cfg.inferred {
+                val section_opt = scan_dir(ar, la, cfg, content_abs, "", none, pages)
+                match section_opt {
+                    some section => {
+                        section.parent = none
+                        return ok Tree{root: section, pages: pages}
+                    }
+                    none => {
+                        return err errors.E_OUT_OF_MEMORY
+                    }
+                }
+            }
+            val root: mut ref NavNode = new_nav(ar, la)
+            if root == none {
+                return err errors.E_OUT_OF_MEMORY
+            }
+            root.title = cfg.title
+            val n: i64 = @len(cfg.nav.children) as i64
+            val i: mut i64 = 0
+            for {
+                if i >= n {
+                    break
+                }
+                if @get(cfg.nav.children, i as usize) is some child_spec {
+                    match build_explicit_node(ar, la, cfg, child_spec, root, pages) {
+                        some child => {
+                            @append(root.children, child)
+                        }
+                        none => {
+                            return err errors.E_PAGE_MISSING
+                        }
+                    }
+                }
+                i++
+            }
+            return ok Tree{root: root, pages: pages}
+        }
+        none => {
+            return err errors.E_OUT_OF_MEMORY
+        }
+    }
+}
+
+pub fn node_contains(node: ref NavNode, url: str.StringView) bool = trust {
+    if node.url.len > 0 && str.eql(node.url, url) {
+        return true
+    }
+    val n: i64 = @len(node.children) as i64
+    val i: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        if @get(node.children, i as usize) is some child {
+            if node_contains(child, url) {
+                return true
+            }
+        }
+        i++
+    }
+    return false
+}
+
+/// Build a breadcrumb trail from root to the node for `url`.
+pub fn find_node(node: ref NavNode, url: str.StringView) option[ref NavNode] = trust {
+    if node.url.len > 0 && str.eql(node.url, url) {
+        return some node
+    }
+    val n: i64 = @len(node.children) as i64
+    val i: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        if @get(node.children, i as usize) is some child {
+            if find_node(child, url) is some found {
+                return some found
+            }
+        }
+        i++
+    }
+    return none
+}

@@ -1,0 +1,1580 @@
+/// A dependency-free Markdown renderer for shelvez.
+///
+/// Supports headings, paragraphs, lists (including task lists), fenced and
+/// indented code, tables, blockquotes, horizontal rules, images, links,
+/// emphasis, strikethrough, inline code, raw HTML blocks, and heading anchors.
+
+val allocators = use("std/allocators")
+val str        = use("std/string")
+val tree       = use("tree.sx")
+val util       = use("sxutil.sx")
+
+pub type MdCtx = {
+    ar: mut allocators.ScopedArenaAllocator
+    la: mut allocators.ListArena
+    base_dir: mut str.StringView
+    toc: mut ref util.ABuf
+    slugs: mut list[str.StringView]
+}
+
+pub type RenderResult = {
+    html: str.StringView
+    toc: str.StringView
+}
+
+type LinkParts = {
+    text: str.StringView
+    target: str.StringView
+    title: str.StringView
+    next: i64
+}
+
+type ListMark = {
+    ordered: mut bool
+    number: mut i64
+    content: mut str.StringView
+}
+
+pub fn split_lines(
+    la: allocators.ListArena,
+    s: str.StringView
+) option[list[str.StringView]] = trust {
+    match @listalloc[allocators.ListArena, str.StringView](la) {
+        ok items => {
+            val pos: mut i64 = 0
+            for {
+                if pos > s.len {
+                    break
+                }
+                val end: mut i64 = pos
+                for {
+                    if end >= s.len {
+                        break
+                    }
+                    if @load8(@ptradd(s.ptr, end)) == 10 {
+                        break
+                    }
+                    end++
+                }
+                val line: str.StringView = str.slice(s, pos, end)
+                if line.len > 0 && @load8(@ptradd(line.ptr, line.len - 1)) == 13 {
+                    @append(items, str.slice(line, 0, line.len - 1))
+                } else {
+                    @append(items, line)
+                }
+                if end >= s.len {
+                    break
+                }
+                pos = end + 1
+            }
+            return some items
+        }
+        err _ => {
+            return none
+        }
+    }
+}
+
+fn at(lines: list[str.StringView], i: i64) str.StringView = {
+    match @get(lines, i as usize) {
+        some line => {
+            return line
+        }
+        none => {
+            return ""
+        }
+    }
+}
+
+fn count(lines: list[str.StringView]) i64 = {
+    return @len(lines) as i64
+}
+
+fn is_blank(line: str.StringView) bool = trust {
+    return str.trim(line).len == 0
+}
+
+fn indent_of(line: str.StringView) i64 = trust {
+    val i: mut i64 = 0
+    for {
+        if i >= line.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(line.ptr, i))
+        if c != 32 && c != 9 {
+            break
+        }
+        i++
+    }
+    return i
+}
+
+fn all_char(s: str.StringView, c: u8) bool = trust {
+    if s.len == 0 {
+        return false
+    }
+    val i: mut i64 = 0
+    for {
+        if i >= s.len {
+            break
+        }
+        if @load8(@ptradd(s.ptr, i)) != c {
+            return false
+        }
+        i++
+    }
+    return true
+}
+
+fn heading_level(line: str.StringView) i64 = trust {
+    val t: str.StringView = str.trim_left(line)
+    val i: mut i64 = 0
+    for {
+        if i >= t.len {
+            break
+        }
+        if @load8(@ptradd(t.ptr, i)) != 35 {
+            break
+        }
+        i++
+    }
+    if i >= 1 && i <= 6 && i < t.len && @load8(@ptradd(t.ptr, i)) == 32 {
+        return i
+    }
+    return 0
+}
+
+fn heading_text(line: str.StringView, level: i64) str.StringView = trust {
+    val t: str.StringView = str.trim_left(line)
+    val text: str.StringView = str.trim(str.slice(t, level + 1, t.len))
+    val end: mut i64 = text.len
+    for {
+        if end <= 0 {
+            break
+        }
+        if @load8(@ptradd(text.ptr, end - 1)) != 35 {
+            break
+        }
+        end--
+    }
+    return str.trim(str.slice(text, 0, end))
+}
+
+fn is_hr(line: str.StringView) bool = trust {
+    val t: str.StringView = str.trim(line)
+    if t.len < 3 {
+        return false
+    }
+    val c: u8 = @load8(t.ptr)
+    if c != 45 && c != 42 && c != 95 {
+        return false
+    }
+    return all_char(t, c)
+}
+
+fn is_fence(line: str.StringView) bool = trust {
+    val t: str.StringView = str.trim_left(line)
+    if t.len < 3 {
+        return false
+    }
+    return str.starts_with(t, "```") || str.starts_with(t, "~~~")
+}
+
+fn fence_marker(line: str.StringView) str.StringView = trust {
+    val t: str.StringView = str.trim_left(line)
+    if str.starts_with(t, "```") {
+        return "```"
+    }
+    return "~~~"
+}
+
+fn fence_language(line: str.StringView) str.StringView = trust {
+    val t: str.StringView = str.trim_left(line)
+    val rest: str.StringView = str.trim(str.slice(t, 3, t.len))
+    val i: mut i64 = 0
+    for {
+        if i >= rest.len {
+            break
+        }
+        if @load8(@ptradd(rest.ptr, i)) == 32 {
+            break
+        }
+        i++
+    }
+    return str.slice(rest, 0, i)
+}
+
+fn is_quote(line: str.StringView) bool = trust {
+    val t: str.StringView = str.trim_left(line)
+    return t.len > 0 && @load8(t.ptr) == 62
+}
+
+fn is_html_block(line: str.StringView) bool = trust {
+    val t: str.StringView = str.trim_left(line)
+    if t.len < 2 || @load8(t.ptr) != 60 {
+        return false
+    }
+    if str.starts_with(t, "<http://") || str.starts_with(t, "<https://") ||
+    str.starts_with(t, "<mailto:") {
+        return false
+    }
+    val c: u8 = @load8(@ptradd(t.ptr, 1))
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 47 || c == 33
+}
+
+fn list_mark(line: str.StringView) ListMark = trust {
+    val t: str.StringView = str.trim_left(line)
+    val result: mut ListMark = @zeroed
+    result.ordered = false
+    result.number = 0
+    result.content = ""
+    if t.len >= 2 {
+        val c: u8 = @load8(t.ptr)
+        if (c == 45 || c == 42 || c == 43) && @load8(@ptradd(t.ptr, 1)) == 32 {
+            result.ordered = false
+            result.content = str.trim_left(str.slice(t, 2, t.len))
+            return result
+        }
+    }
+    val i: mut i64 = 0
+    for {
+        if i >= t.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(t.ptr, i))
+        if c < 48 || c > 57 {
+            break
+        }
+        i++
+    }
+    if i > 0 && i + 1 < t.len {
+        if @load8(@ptradd(t.ptr, i)) == 46 && @load8(@ptradd(t.ptr, i + 1)) == 32 {
+            result.ordered = true
+            result.number = 1
+            result.content = str.trim_left(str.slice(t, i + 2, t.len))
+            return result
+        }
+    }
+    return result
+}
+
+fn has_list_mark(line: str.StringView) bool = trust {
+    val m: ListMark = list_mark(line)
+    return m.content.len > 0
+}
+
+fn table_separator(line: str.StringView) bool = trust {
+    val t: str.StringView = str.trim(line)
+    if t.len < 3 {
+        return false
+    }
+    val pipes: mut i64 = 0
+    val dashes: mut i64 = 0
+    val i: mut i64 = 0
+    for {
+        if i >= t.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(t.ptr, i))
+        if c == 124 {
+            pipes++
+        } elif c == 45 {
+            dashes++
+        } elif c == 58 || c == 32 {
+        } else {
+            return false
+        }
+        i++
+    }
+    return dashes >= 3 && pipes >= 1
+}
+
+fn has_table_start(lines: list[str.StringView], i: i64, end: i64) bool = trust {
+    if i + 1 >= end {
+        return false
+    }
+    val head: str.StringView = at(lines, i)
+    val sep: str.StringView = at(lines, i + 1)
+    return str.contains(head, "|") && table_separator(sep)
+}
+
+fn is_block_start(lines: list[str.StringView], i: i64, end: i64) bool = trust {
+    if i >= end {
+        return false
+    }
+    val line: str.StringView = at(lines, i)
+    if is_blank(line) {
+        return true
+    }
+    if heading_level(line) > 0 || is_fence(line) || is_hr(line) || is_quote(line) {
+        return true
+    }
+    if has_list_mark(line) || is_html_block(line) {
+        return true
+    }
+    return has_table_start(lines, i, end)
+}
+
+fn slug_for(ctx: mut ref MdCtx, text: str.StringView) str.StringView = trust {
+    val base: str.StringView = util.slugify(ctx.ar, text)
+    val n: i64 = @len(ctx.slugs) as i64
+    val matched: mut bool = false
+    val i: mut i64 = 0
+    for {
+        if i >= n {
+            break
+        }
+        if @get(ctx.slugs, i as usize) is some existing {
+            if str.eql(existing, base) {
+                matched = true
+            }
+        }
+        i++
+    }
+    if !matched {
+        @append(ctx.slugs, base)
+        return base
+    }
+    val counter: mut i64 = 2
+    for {
+        val out: mut util.ABuf = util.abuf_new(ctx.ar)
+        util.abuf_append(ctx.ar, @addr(out), base)
+        util.abuf_append_char(ctx.ar, @addr(out), 45)
+        util.abuf_append_int(ctx.ar, @addr(out), counter)
+        val candidate: str.StringView = util.abuf_view(@addr(out))
+        val taken: mut bool = false
+        val j: mut i64 = 0
+        for {
+            if j >= n {
+                break
+            }
+            if @get(ctx.slugs, j as usize) is some existing {
+                if str.eql(existing, candidate) {
+                    taken = true
+                }
+            }
+            j++
+        }
+        if !taken {
+            @append(ctx.slugs, candidate)
+            return candidate
+        }
+        counter++
+    }
+    return base
+}
+
+fn append_escaped(
+    ctx: ref MdCtx,
+    b: mut ref util.ABuf,
+    c: u8
+) void = trust {
+    if c == 38 {
+        util.abuf_append(ctx.ar, b, "&amp;")
+    } elif c == 60 {
+        util.abuf_append(ctx.ar, b, "&lt;")
+    } elif c == 62 {
+        util.abuf_append(ctx.ar, b, "&gt;")
+    } elif c == 34 {
+        util.abuf_append(ctx.ar, b, "&quot;")
+    } else {
+        util.abuf_append_char(ctx.ar, b, c)
+    }
+}
+
+fn append_url(
+    ctx: mut ref MdCtx,
+    b: mut ref util.ABuf,
+    url: str.StringView
+) void = trust {
+    val i: mut i64 = 0
+    for {
+        if i >= url.len {
+            break
+        }
+        append_escaped(ctx, b, @load8(@ptradd(url.ptr, i)))
+        i++
+    }
+}
+
+fn starts_external(url: str.StringView) bool = trust {
+    return str.starts_with(url, "http://") || str.starts_with(url, "https://") ||
+    str.starts_with(url, "mailto:") || str.starts_with(url, "//") ||
+    str.starts_with(url, "data:") || str.starts_with(url, "tel:")
+}
+
+fn split_suffix(url: str.StringView) option[i64] = trust {
+    val hash: mut i64 = -1
+    val query: mut i64 = -1
+    if str.find(url, "#") is some p {
+        hash = p
+    }
+    if str.find(url, "?") is some p {
+        query = p
+    }
+    if hash < 0 && query < 0 {
+        return none
+    }
+    val cut: mut i64 = url.len
+    if hash >= 0 && hash < cut {
+        cut = hash
+    }
+    if query >= 0 && query < cut {
+        cut = query
+    }
+    return some cut
+}
+
+fn resolve_url(
+    ctx: ref MdCtx,
+    url: str.StringView
+) str.StringView = trust {
+    val u: str.StringView = str.trim(url)
+    if u.len == 0 {
+        return ""
+    }
+    val first: u8 = @load8(u.ptr)
+    if first == 35 || first == 47 || starts_external(u) {
+        return u
+    }
+    val suffix_at: mut i64 = u.len
+    if split_suffix(u) is some cut {
+        suffix_at = cut
+    }
+    val path: str.StringView = str.slice(u, 0, suffix_at)
+    val suffix: str.StringView = str.slice(u, suffix_at, u.len)
+    val is_md: bool = util.path_lower_ext_is(path, c".md") ||
+    util.path_lower_ext_is(path, c".markdown")
+    val joined: str.StringView = util.normalize_rel(
+        ctx.ar,
+        util.path_join(ctx.ar, ctx.base_dir, path)
+    )
+    val target: mut str.StringView = ""
+    if is_md {
+        target = tree.url_for_rel(ctx.ar, joined)
+    } else {
+        val out: mut util.ABuf = util.abuf_new(ctx.ar)
+        util.abuf_append(ctx.ar, @addr(out), "/")
+        util.abuf_append(ctx.ar, @addr(out), util.url_encode_path(ctx.ar, joined))
+        target = util.abuf_view(@addr(out))
+    }
+    if suffix.len == 0 {
+        return target
+    }
+    return util.view_concat3(ctx.ar, target, suffix, "")
+}
+
+fn parse_link(s: str.StringView, start: i64) option[LinkParts] = trust {
+    val i: mut i64 = start
+    if i >= s.len || @load8(@ptradd(s.ptr, i)) != 91 {
+        return none
+    }
+    i++
+    val text_start: i64 = i
+    val close: mut i64 = -1
+    for {
+        if i >= s.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s.ptr, i))
+        if c == 92 {
+            i = i + 2
+            continue
+        }
+        if c == 93 {
+            close = i
+            break
+        }
+        i++
+    }
+    if close < 0 || close + 1 >= s.len {
+        return none
+    }
+    if @load8(@ptradd(s.ptr, close + 1)) != 40 {
+        return none
+    }
+    val text: str.StringView = str.slice(s, text_start, close)
+    i = close + 2
+    val target_start: i64 = i
+    val paren: mut i64 = -1
+    for {
+        if i >= s.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s.ptr, i))
+        if c == 92 {
+            i = i + 2
+            continue
+        }
+        if c == 41 {
+            paren = i
+            break
+        }
+        i++
+    }
+    if paren < 0 {
+        return none
+    }
+    val inner: str.StringView = str.trim(str.slice(s, target_start, paren))
+    val target: mut str.StringView = inner
+    val title: mut str.StringView = ""
+    val space: mut i64 = -1
+    val k: mut i64 = 0
+    val quoted: mut bool = false
+    for {
+        if k >= inner.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(inner.ptr, k))
+        if (c == 34 || c == 39) && k > 0 && @load8(@ptradd(inner.ptr, k - 1)) == 32 {
+            quoted = true
+            space = k - 1
+            break
+        }
+        k++
+    }
+    if quoted {
+        target = str.slice(inner, 0, space)
+        val rest: str.StringView = str.trim(str.slice(inner, space + 1, inner.len))
+        if rest.len >= 2 {
+            title = str.slice(rest, 1, rest.len - 1)
+        }
+    }
+    return some LinkParts{text: text, target: target, title: title, next: paren + 1}
+}
+
+fn render_inline(ctx: mut ref MdCtx, b: mut ref util.ABuf, s: str.StringView) void = trust {
+    val i: mut i64 = 0
+    for {
+        if i >= s.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(s.ptr, i))
+        if c == 10 {
+            util.abuf_append(ctx.ar, b, "<br>\n")
+            i++
+            continue
+        }
+        if c == 92 && i + 1 < s.len {
+            val next: u8 = @load8(@ptradd(s.ptr, i + 1))
+            if next == 10 {
+                util.abuf_append(ctx.ar, b, "<br>\n")
+                i = i + 2
+                continue
+            }
+            append_escaped(ctx, b, next)
+            i = i + 2
+            continue
+        }
+        if c == 96 {
+            val run: mut i64 = 0
+            for {
+                if i + run >= s.len || @load8(@ptradd(s.ptr, i + run)) != 96 {
+                    break
+                }
+                run++
+            }
+            val needle_buf: mut util.ABuf = util.abuf_new(ctx.ar)
+            val r: mut i64 = 0
+            for {
+                if r >= run {
+                    break
+                }
+                util.abuf_append_char(ctx.ar, @addr(needle_buf), 96)
+                r++
+            }
+            val needle: str.StringView = util.abuf_view(@addr(needle_buf))
+            match str.find(str.slice(s, i + run, s.len), needle) {
+                some rel => {
+                    val code: str.StringView = str.slice(s, i + run, i + run + rel)
+                    util.abuf_append(ctx.ar, b, "<code>")
+                    util.html_escape(ctx.ar, b, code)
+                    util.abuf_append(ctx.ar, b, "</code>")
+                    i = i + run + rel + run
+                }
+                none => {
+                    append_escaped(ctx, b, c)
+                    i++
+                }
+            }
+            continue
+        }
+        if c == 33 && i + 1 < s.len && @load8(@ptradd(s.ptr, i + 1)) == 91 {
+            match parse_link(s, i + 1) {
+                some parts => {
+                    util.abuf_append(ctx.ar, b, "<img src=\"")
+                    append_url(ctx, b, resolve_url(ctx, parts.target))
+                    util.abuf_append(ctx.ar, b, "\" alt=\"")
+                    util.html_escape(ctx.ar, b, parts.text)
+                    util.abuf_append(ctx.ar, b, "\"")
+                    if parts.title.len > 0 {
+                        util.abuf_append(ctx.ar, b, " title=\"")
+                        util.html_escape(ctx.ar, b, parts.title)
+                        util.abuf_append(ctx.ar, b, "\"")
+                    }
+                    util.abuf_append(ctx.ar, b, " loading=\"lazy\">")
+                    i = parts.next
+                }
+                none => {
+                    append_escaped(ctx, b, c)
+                    i++
+                }
+            }
+            continue
+        }
+        if c == 91 {
+            match parse_link(s, i) {
+                some parts => {
+                    util.abuf_append(ctx.ar, b, "<a href=\"")
+                    append_url(ctx, b, resolve_url(ctx, parts.target))
+                    util.abuf_append(ctx.ar, b, "\"")
+                    if parts.title.len > 0 {
+                        util.abuf_append(ctx.ar, b, " title=\"")
+                        util.html_escape(ctx.ar, b, parts.title)
+                        util.abuf_append(ctx.ar, b, "\"")
+                    }
+                    if starts_external(parts.target) {
+                        util.abuf_append(ctx.ar, b, " rel=\"noreferrer noopener\"")
+                    }
+                    util.abuf_append(ctx.ar, b, ">")
+                    render_inline(ctx, b, parts.text)
+                    util.abuf_append(ctx.ar, b, "</a>")
+                    i = parts.next
+                }
+                none => {
+                    append_escaped(ctx, b, c)
+                    i++
+                }
+            }
+            continue
+        }
+        if c == 60 {
+            if str.find(str.slice(s, i + 1, s.len), ">") is some rel {
+                val inner: str.StringView = str.slice(s, i + 1, i + 1 + rel)
+                if str.starts_with(inner, "http://") || str.starts_with(inner, "https://") ||
+                str.starts_with(inner, "mailto:") {
+                    util.abuf_append(ctx.ar, b, "<a href=\"")
+                    append_url(ctx, b, inner)
+                    util.abuf_append(ctx.ar, b, "\">")
+                    util.html_escape(ctx.ar, b, inner)
+                    util.abuf_append(ctx.ar, b, "</a>")
+                    i = i + rel + 2
+                    continue
+                }
+                if inner.len > 0 {
+                    val first: u8 = @load8(inner.ptr)
+                    val tagish: bool = (first >= 65 && first <= 90) ||
+                    (first >= 97 && first <= 122) || first == 47 || first == 33
+                    if tagish {
+                        util.abuf_append(ctx.ar, b, "<")
+                        util.abuf_append(ctx.ar, b, inner)
+                        util.abuf_append(ctx.ar, b, ">")
+                        i = i + rel + 2
+                        continue
+                    }
+                }
+            }
+            append_escaped(ctx, b, c)
+            i++
+            continue
+        }
+        if c == 38 {
+            if str.find(str.slice(s, i + 1, s.len), ";") is some rel {
+                if rel > 0 && rel <= 10 {
+                    val entity: str.StringView = str.slice(s, i, i + rel + 2)
+                    util.abuf_append(ctx.ar, b, entity)
+                    i = i + rel + 2
+                    continue
+                }
+            }
+            util.abuf_append(ctx.ar, b, "&amp;")
+            i++
+            continue
+        }
+        if (c == 42 || c == 95) && i + 1 < s.len && @load8(@ptradd(s.ptr, i + 1)) == c {
+            val needle: mut str.StringView = "__"
+            if c == 42 {
+                needle = "**"
+            }
+            if str.find(str.slice(s, i + 2, s.len), needle) is some rel {
+                val inner: str.StringView = str.slice(s, i + 2, i + 2 + rel)
+                util.abuf_append(ctx.ar, b, "<strong>")
+                render_inline(ctx, b, inner)
+                util.abuf_append(ctx.ar, b, "</strong>")
+                i = i + 2 + rel + 2
+                continue
+            }
+        }
+        if c == 42 || c == 95 {
+            if str.find(str.slice(s, i + 1, s.len), str.slice(s, i, i + 1)) is some rel {
+                if rel > 0 {
+                    val inner: str.StringView = str.slice(s, i + 1, i + 1 + rel)
+                    util.abuf_append(ctx.ar, b, "<em>")
+                    render_inline(ctx, b, inner)
+                    util.abuf_append(ctx.ar, b, "</em>")
+                    i = i + 1 + rel + 1
+                    continue
+                }
+            }
+        }
+        if c == 126 && i + 1 < s.len && @load8(@ptradd(s.ptr, i + 1)) == 126 {
+            if str.find(str.slice(s, i + 2, s.len), "~~") is some rel {
+                val inner: str.StringView = str.slice(s, i + 2, i + 2 + rel)
+                util.abuf_append(ctx.ar, b, "<del>")
+                render_inline(ctx, b, inner)
+                util.abuf_append(ctx.ar, b, "</del>")
+                i = i + 2 + rel + 2
+                continue
+            }
+        }
+        append_escaped(ctx, b, c)
+        i++
+    }
+}
+
+fn is_ident_start(c: u8) bool = {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+}
+
+fn is_ident_char(c: u8) bool = {
+    return is_ident_start(c) || (c >= 48 && c <= 57)
+}
+
+fn is_digit(c: u8) bool = {
+    return c >= 48 && c <= 57
+}
+
+fn is_keyword(word: str.StringView) bool = trust {
+    return str.eql(word, "fn") || str.eql(word, "spec") || str.eql(word, "val") ||
+    str.eql(word, "mut") || str.eql(word, "pub") || str.eql(word, "type") ||
+    str.eql(word, "pre") || str.eql(word, "post") || str.eql(word, "return") ||
+    str.eql(word, "if") || str.eql(word, "else") || str.eql(word, "elif") ||
+    str.eql(word, "trust") || str.eql(word, "inline") || str.eql(word, "use") ||
+    str.eql(word, "ref") || str.eql(word, "for") || str.eql(word, "in") ||
+    str.eql(word, "some") || str.eql(word, "none") || str.eql(word, "ok") ||
+    str.eql(word, "err") || str.eql(word, "match") || str.eql(word, "true") ||
+    str.eql(word, "false") || str.eql(word, "defer") || str.eql(word, "break") ||
+    str.eql(word, "continue") || str.eql(word, "as") || str.eql(word, "assert") ||
+    str.eql(word, "when") || str.eql(word, "union") || str.eql(word, "enum") ||
+    str.eql(word, "extern") || str.eql(word, "link") || str.eql(word, "lib") ||
+    str.eql(word, "guarded") || str.eql(word, "not") || str.eql(word, "test") ||
+    str.eql(word, "guard") || str.eql(word, "invariant") || str.eql(word, "otherwise") ||
+    str.eql(word, "or") || str.eql(word, "is") || str.eql(word, "and") ||
+    str.eql(word, "class") || str.eql(word, "const") || str.eql(word, "let") ||
+    str.eql(word, "var") || str.eql(word, "function") || str.eql(word, "new") ||
+    str.eql(word, "static") || str.eql(word, "void") || str.eql(word, "int") ||
+    str.eql(word, "char") || str.eql(word, "struct") || str.eql(word, "typedef") ||
+    str.eql(word, "include") || str.eql(word, "def") || str.eql(word, "import") ||
+    str.eql(word, "from") || str.eql(word, "null") || str.eql(word, "undefined") ||
+    str.eql(word, "async") || str.eql(word, "await") || str.eql(word, "export")
+}
+
+fn is_builtin_type(word: str.StringView) bool = trust {
+    return str.eql(word, "i8") || str.eql(word, "i16") || str.eql(word, "i32") ||
+    str.eql(word, "i64") || str.eql(word, "u8") || str.eql(word, "u16") ||
+    str.eql(word, "u32") || str.eql(word, "u64") || str.eql(word, "usize") ||
+    str.eql(word, "isize") || str.eql(word, "f32") || str.eql(word, "f64") ||
+    str.eql(word, "bool") || str.eql(word, "str") || str.eql(word, "option") ||
+    str.eql(word, "result") || str.eql(word, "list") || str.eql(word, "argspack") ||
+    str.eql(word, "String") || str.eql(word, "StringView") || str.eql(word, "usize") ||
+    str.eql(word, "float") || str.eql(word, "double") || str.eql(word, "size_t")
+}
+
+fn hash_comments(lang: str.StringView) bool = trust {
+    return str.eql(lang, "sh") || str.eql(lang, "bash") || str.eql(lang, "zsh") ||
+    str.eql(lang, "python") || str.eql(lang, "py") || str.eql(lang, "toml") ||
+    str.eql(lang, "yaml") || str.eql(lang, "yml") || str.eql(lang, "ruby") ||
+    str.eql(lang, "makefile")
+}
+
+fn slash_comments(lang: str.StringView) bool = trust {
+    return str.eql(lang, "spectre") || str.eql(lang, "sx") || str.eql(lang, "c") ||
+    str.eql(lang, "h") || str.eql(lang, "js") || str.eql(lang, "javascript") ||
+    str.eql(lang, "ts") || str.eql(lang, "typescript") || str.eql(lang, "json") ||
+    str.eql(lang, "rust") || str.eql(lang, "go") || str.eql(lang, "java") ||
+    str.eql(lang, "css") || lang.len == 0
+}
+
+fn highlight(
+    ctx: mut ref MdCtx,
+    b: mut ref util.ABuf,
+    code: str.StringView,
+    lang: str.StringView
+) void = trust {
+    if str.eql(lang, "text") || str.eql(lang, "plaintext") || str.eql(lang, "txt") ||
+    str.eql(lang, "html") || str.eql(lang, "xml") || str.eql(lang, "markdown") {
+        util.html_escape(ctx.ar, b, code)
+        return
+    }
+    val i: mut i64 = 0
+    for {
+        if i >= code.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(code.ptr, i))
+        if c == 47 && i + 1 < code.len && @load8(@ptradd(code.ptr, i + 1)) == 47 &&
+        slash_comments(lang) {
+            util.abuf_append(ctx.ar, b, "<span class=\"tok-com\">")
+            for {
+                if i >= code.len {
+                    break
+                }
+                val d: u8 = @load8(@ptradd(code.ptr, i))
+                if d == 10 {
+                    break
+                }
+                append_escaped(ctx, b, d)
+                i++
+            }
+            util.abuf_append(ctx.ar, b, "</span>")
+            continue
+        }
+        if c == 35 && hash_comments(lang) {
+            util.abuf_append(ctx.ar, b, "<span class=\"tok-com\">")
+            for {
+                if i >= code.len {
+                    break
+                }
+                val d: u8 = @load8(@ptradd(code.ptr, i))
+                if d == 10 {
+                    break
+                }
+                append_escaped(ctx, b, d)
+                i++
+            }
+            util.abuf_append(ctx.ar, b, "</span>")
+            continue
+        }
+        if c == 34 {
+            util.abuf_append(ctx.ar, b, "<span class=\"tok-str\">")
+            append_escaped(ctx, b, c)
+            i++
+            for {
+                if i >= code.len {
+                    break
+                }
+                val d: u8 = @load8(@ptradd(code.ptr, i))
+                append_escaped(ctx, b, d)
+                i++
+                if d == 92 && i < code.len {
+                    append_escaped(ctx, b, @load8(@ptradd(code.ptr, i)))
+                    i++
+                    continue
+                }
+                if d == 34 || d == 10 {
+                    break
+                }
+            }
+            util.abuf_append(ctx.ar, b, "</span>")
+            continue
+        }
+        if c == 39 && !str.eql(lang, "json") {
+            util.abuf_append(ctx.ar, b, "<span class=\"tok-str\">")
+            append_escaped(ctx, b, c)
+            i++
+            for {
+                if i >= code.len {
+                    break
+                }
+                val d: u8 = @load8(@ptradd(code.ptr, i))
+                append_escaped(ctx, b, d)
+                i++
+                if d == 92 && i < code.len {
+                    append_escaped(ctx, b, @load8(@ptradd(code.ptr, i)))
+                    i++
+                    continue
+                }
+                if d == 39 || d == 10 {
+                    break
+                }
+            }
+            util.abuf_append(ctx.ar, b, "</span>")
+            continue
+        }
+        if is_digit(c) {
+            util.abuf_append(ctx.ar, b, "<span class=\"tok-num\">")
+            for {
+                if i >= code.len {
+                    break
+                }
+                val d: u8 = @load8(@ptradd(code.ptr, i))
+                if !is_digit(d) && d != 46 && d != 120 && d != 88 &&
+                !((d >= 97 && d <= 102) || (d >= 65 && d <= 70)) {
+                    break
+                }
+                append_escaped(ctx, b, d)
+                i++
+            }
+            util.abuf_append(ctx.ar, b, "</span>")
+            continue
+        }
+        if is_ident_start(c) {
+            val start: i64 = i
+            for {
+                if i >= code.len {
+                    break
+                }
+                if !is_ident_char(@load8(@ptradd(code.ptr, i))) {
+                    break
+                }
+                i++
+            }
+            val word: str.StringView = str.slice(code, start, i)
+            if is_keyword(word) {
+                util.abuf_append(ctx.ar, b, "<span class=\"tok-kw\">")
+                util.html_escape(ctx.ar, b, word)
+                util.abuf_append(ctx.ar, b, "</span>")
+            } elif is_builtin_type(word) {
+                util.abuf_append(ctx.ar, b, "<span class=\"tok-type\">")
+                util.html_escape(ctx.ar, b, word)
+                util.abuf_append(ctx.ar, b, "</span>")
+            } else {
+                util.html_escape(ctx.ar, b, word)
+            }
+            continue
+        }
+        append_escaped(ctx, b, c)
+        i++
+    }
+}
+
+fn render_code_block(
+    ctx: mut ref MdCtx,
+    b: mut ref util.ABuf,
+    lines: list[str.StringView],
+    start: i64,
+    end: i64
+) i64 = trust {
+    val marker: str.StringView = fence_marker(at(lines, start))
+    val lang: str.StringView = fence_language(at(lines, start))
+    val code: mut util.ABuf = util.abuf_new(ctx.ar)
+    val i: mut i64 = start + 1
+    for {
+        if i >= end {
+            break
+        }
+        val line: str.StringView = at(lines, i)
+        if str.starts_with(str.trim_left(line), marker) {
+            i++
+            break
+        }
+        if code.len > 0 {
+            util.abuf_append_char(ctx.ar, @addr(code), 10)
+        }
+        util.abuf_append(ctx.ar, @addr(code), line)
+        i++
+    }
+    util.abuf_append(ctx.ar, b, "<pre><code")
+    if lang.len > 0 {
+        util.abuf_append(ctx.ar, b, " class=\"language-")
+        util.html_escape(ctx.ar, b, lang)
+        util.abuf_append(ctx.ar, b, "\"")
+    }
+    util.abuf_append(ctx.ar, b, ">")
+    highlight(ctx, b, util.abuf_view(@addr(code)), lang)
+    util.abuf_append(ctx.ar, b, "</code></pre>\n")
+    return i
+}
+
+fn render_indented_code(
+    ctx: ref MdCtx,
+    b: mut ref util.ABuf,
+    lines: list[str.StringView],
+    start: i64,
+    end: i64
+) i64 = trust {
+    val code: mut util.ABuf = util.abuf_new(ctx.ar)
+    val i: mut i64 = start
+    for {
+        if i >= end {
+            break
+        }
+        val line: str.StringView = at(lines, i)
+        if is_blank(line) {
+            if code.len > 0 {
+                util.abuf_append_char(ctx.ar, @addr(code), 10)
+            }
+            i++
+            continue
+        }
+        if indent_of(line) < 4 {
+            break
+        }
+        if code.len > 0 {
+            util.abuf_append_char(ctx.ar, @addr(code), 10)
+        }
+        util.abuf_append(ctx.ar, @addr(code), str.slice(line, 4, line.len))
+        i++
+    }
+    util.abuf_append(ctx.ar, b, "<pre><code>")
+    util.html_escape(ctx.ar, b, util.abuf_view(@addr(code)))
+    util.abuf_append(ctx.ar, b, "</code></pre>\n")
+    return i
+}
+
+fn render_heading(
+    ctx: mut ref MdCtx,
+    b: mut ref util.ABuf,
+    line: str.StringView
+) void = trust {
+    val level: i64 = heading_level(line)
+    val text: str.StringView = heading_text(line, level)
+    val slug: str.StringView = slug_for(ctx, text)
+    util.abuf_append(ctx.ar, b, "<h")
+    util.abuf_append_int(ctx.ar, b, level)
+    util.abuf_append(ctx.ar, b, " id=\"")
+    append_url(ctx, b, slug)
+    util.abuf_append(ctx.ar, b, "\"><a class=\"heading-anchor\" href=\"#")
+    append_url(ctx, b, slug)
+    util.abuf_append(ctx.ar, b, "\" aria-hidden=\"true\">#</a>")
+    render_inline(ctx, b, text)
+    util.abuf_append(ctx.ar, b, "</h")
+    util.abuf_append_int(ctx.ar, b, level)
+    util.abuf_append(ctx.ar, b, ">\n")
+    if level >= 2 && level <= 4 {
+        util.abuf_append(ctx.ar, ctx.toc, "<a class=\"toc-link toc-level-")
+        util.abuf_append_int(ctx.ar, ctx.toc, level)
+        util.abuf_append(ctx.ar, ctx.toc, "\" href=\"#")
+        append_url(ctx, ctx.toc, slug)
+        util.abuf_append(ctx.ar, ctx.toc, "\">")
+        util.html_escape(ctx.ar, ctx.toc, text)
+        util.abuf_append(ctx.ar, ctx.toc, "</a>\n")
+    }
+}
+
+fn render_paragraph(
+    ctx: mut ref MdCtx,
+    b: mut ref util.ABuf,
+    lines: list[str.StringView],
+    start: i64,
+    end: i64
+) i64 = trust {
+    val text: mut util.ABuf = util.abuf_new(ctx.ar)
+    val i: mut i64 = start
+    val setext: mut i64 = 0
+    for {
+        if i >= end {
+            break
+        }
+        val line: str.StringView = at(lines, i)
+        if is_blank(line) {
+            break
+        }
+        if i > start {
+            if all_char(str.trim(line), 61) && str.trim(line).len >= 2 {
+                setext = 1
+                i++
+                break
+            }
+            if all_char(str.trim(line), 45) && str.trim(line).len >= 2 {
+                setext = 2
+                i++
+                break
+            }
+            if is_block_start(lines, i, end) && !has_table_start(lines, i, end) {
+                break
+            }
+        }
+        if text.len > 0 {
+            val hard: bool = line.len >= 2 &&
+            @load8(@ptradd(line.ptr, line.len - 1)) == 32 &&
+            @load8(@ptradd(line.ptr, line.len - 2)) == 32
+            if hard {
+                util.abuf_append_char(ctx.ar, @addr(text), 10)
+            } else {
+                util.abuf_append_char(ctx.ar, @addr(text), 32)
+            }
+        }
+        util.abuf_append(ctx.ar, @addr(text), str.trim(line))
+        i++
+    }
+    if setext > 0 {
+        val slug: str.StringView = slug_for(ctx, util.abuf_view(@addr(text)))
+        util.abuf_append(ctx.ar, b, "<h")
+        util.abuf_append_int(ctx.ar, b, setext)
+        util.abuf_append(ctx.ar, b, " id=\"")
+        append_url(ctx, b, slug)
+        util.abuf_append(ctx.ar, b, "\"><a class=\"heading-anchor\" href=\"#")
+        append_url(ctx, b, slug)
+        util.abuf_append(ctx.ar, b, "\" aria-hidden=\"true\">#</a>")
+        render_inline(ctx, b, util.abuf_view(@addr(text)))
+        util.abuf_append(ctx.ar, b, "</h")
+        util.abuf_append_int(ctx.ar, b, setext)
+        util.abuf_append(ctx.ar, b, ">\n")
+        if setext >= 2 {
+            util.abuf_append(ctx.ar, ctx.toc, "<a class=\"toc-link toc-level-")
+            util.abuf_append_int(ctx.ar, ctx.toc, setext)
+            util.abuf_append(ctx.ar, ctx.toc, "\" href=\"#")
+            append_url(ctx, ctx.toc, slug)
+            util.abuf_append(ctx.ar, ctx.toc, "\">")
+            util.html_escape(ctx.ar, ctx.toc, util.abuf_view(@addr(text)))
+            util.abuf_append(ctx.ar, ctx.toc, "</a>\n")
+        }
+    } else {
+        util.abuf_append(ctx.ar, b, "<p>")
+        render_inline(ctx, b, util.abuf_view(@addr(text)))
+        util.abuf_append(ctx.ar, b, "</p>\n")
+    }
+    return i
+}
+
+fn render_quote(
+    ctx: mut ref MdCtx,
+    b: mut ref util.ABuf,
+    lines: list[str.StringView],
+    start: i64,
+    end: i64
+) i64 = trust {
+    val inner: mut util.ABuf = util.abuf_new(ctx.ar)
+    val i: mut i64 = start
+    for {
+        if i >= end {
+            break
+        }
+        val line: str.StringView = at(lines, i)
+        if is_blank(line) {
+            val nxt: str.StringView = at(lines, i + 1)
+            if i + 1 < end && is_quote(nxt) {
+                util.abuf_append_char(ctx.ar, @addr(inner), 10)
+                i++
+                continue
+            }
+            break
+        }
+        if !is_quote(line) {
+            break
+        }
+        val t: str.StringView = str.trim_left(line)
+        val rest: mut str.StringView = str.slice(t, 1, t.len)
+        if rest.len > 0 && @load8(rest.ptr) == 32 {
+            rest = str.slice(rest, 1, rest.len)
+        }
+        if inner.len > 0 {
+            util.abuf_append_char(ctx.ar, @addr(inner), 10)
+        }
+        util.abuf_append(ctx.ar, @addr(inner), rest)
+        i++
+    }
+    util.abuf_append(ctx.ar, b, "<blockquote>\n")
+    if split_lines(ctx.la, util.abuf_view(@addr(inner))) is some inner_lines {
+        blocks(ctx, b, inner_lines, 0, count(inner_lines))
+    }
+    util.abuf_append(ctx.ar, b, "</blockquote>\n")
+    return i
+}
+
+fn split_cells(
+    la: allocators.ListArena,
+    line: str.StringView
+) option[list[str.StringView]] = trust {
+    match @listalloc[allocators.ListArena, str.StringView](la) {
+        ok cells => {
+            val t: str.StringView = str.trim(str.trim(line))
+            val start: mut i64 = 0
+            if t.len > 0 && @load8(t.ptr) == 124 {
+                start = 1
+            }
+            val end: mut i64 = t.len
+            if t.len > 0 && @load8(@ptradd(t.ptr, t.len - 1)) == 124 {
+                end = t.len - 1
+            }
+            val i: mut i64 = start
+            val seg: mut i64 = start
+            for {
+                if i > end {
+                    break
+                }
+                if i == end || @load8(@ptradd(t.ptr, i)) == 124 {
+                    @append(cells, str.trim(str.slice(t, seg, i)))
+                    seg = i + 1
+                }
+                i++
+            }
+            return some cells
+        }
+        err _ => {
+            return none
+        }
+    }
+}
+
+fn cell_align(cell: str.StringView) i64 = trust {
+    val t: str.StringView = str.trim(cell)
+    val left: bool = t.len > 0 && @load8(t.ptr) == 58
+    val right: bool = t.len > 0 && @load8(@ptradd(t.ptr, t.len - 1)) == 58
+    if left && right {
+        return 3
+    }
+    if right {
+        return 2
+    }
+    if left {
+        return 1
+    }
+    return 0
+}
+
+fn render_table(
+    ctx: mut ref MdCtx,
+    b: mut ref util.ABuf,
+    lines: list[str.StringView],
+    start: i64,
+    end: i64
+) i64 = trust {
+    val head_cells = split_cells(ctx.la, at(lines, start))
+    val sep_cells = split_cells(ctx.la, at(lines, start + 1))
+    util.abuf_append(ctx.ar, b, "<div class=\"table-wrap\"><table>\n<thead><tr>")
+    if head_cells is some cells {
+        val n: i64 = @len(cells) as i64
+        val i: mut i64 = 0
+        for {
+            if i >= n {
+                break
+            }
+            val align: mut i64 = 0
+            if sep_cells is some seps {
+                if i < @len(seps) as i64 {
+                    if @get(seps, i as usize) is some sep {
+                        align = cell_align(sep)
+                    }
+                }
+            }
+            util.abuf_append(ctx.ar, b, "<th")
+            if align == 1 {
+                util.abuf_append(ctx.ar, b, " class=\"align-left\"")
+            } elif align == 2 {
+                util.abuf_append(ctx.ar, b, " class=\"align-right\"")
+            } elif align == 3 {
+                util.abuf_append(ctx.ar, b, " class=\"align-center\"")
+            }
+            util.abuf_append(ctx.ar, b, ">")
+            if @get(cells, i as usize) is some cell {
+                render_inline(ctx, b, cell)
+            }
+            util.abuf_append(ctx.ar, b, "</th>")
+            i++
+        }
+    }
+    util.abuf_append(ctx.ar, b, "</tr></thead>\n<tbody>\n")
+    val i: mut i64 = start + 2
+    for {
+        if i >= end {
+            break
+        }
+        val line: str.StringView = at(lines, i)
+        if is_blank(line) || !str.contains(line, "|") {
+            break
+        }
+        util.abuf_append(ctx.ar, b, "<tr>")
+        if split_cells(ctx.la, line) is some cells {
+            val n: i64 = @len(cells) as i64
+            val j: mut i64 = 0
+            for {
+                if j >= n {
+                    break
+                }
+                val align: mut i64 = 0
+                if sep_cells is some seps {
+                    if j < @len(seps) as i64 {
+                        if @get(seps, j as usize) is some sep {
+                            align = cell_align(sep)
+                        }
+                    }
+                }
+                util.abuf_append(ctx.ar, b, "<td")
+                if align == 1 {
+                    util.abuf_append(ctx.ar, b, " class=\"align-left\"")
+                } elif align == 2 {
+                    util.abuf_append(ctx.ar, b, " class=\"align-right\"")
+                } elif align == 3 {
+                    util.abuf_append(ctx.ar, b, " class=\"align-center\"")
+                }
+                util.abuf_append(ctx.ar, b, ">")
+                if @get(cells, j as usize) is some cell {
+                    render_inline(ctx, b, cell)
+                }
+                util.abuf_append(ctx.ar, b, "</td>")
+                j++
+            }
+        }
+        util.abuf_append(ctx.ar, b, "</tr>\n")
+        i++
+    }
+    util.abuf_append(ctx.ar, b, "</tbody></table></div>\n")
+    return i
+}
+
+fn render_list(
+    ctx: mut ref MdCtx,
+    b: mut ref util.ABuf,
+    lines: list[str.StringView],
+    start: i64,
+    end: i64
+) i64 = trust {
+    val first: ListMark = list_mark(at(lines, start))
+    val ordered: bool = first.ordered
+    if ordered {
+        util.abuf_append(ctx.ar, b, "<ol>\n")
+    } else {
+        util.abuf_append(ctx.ar, b, "<ul>\n")
+    }
+    val base_indent: i64 = indent_of(at(lines, start))
+    val i: mut i64 = start
+    for {
+        if i >= end {
+            break
+        }
+        val line: str.StringView = at(lines, i)
+        if is_blank(line) {
+            break
+        }
+        if indent_of(line) != base_indent {
+            break
+        }
+        val mark: ListMark = list_mark(line)
+        if mark.content.len == 0 || mark.ordered != ordered {
+            break
+        }
+        util.abuf_append(ctx.ar, b, "<li>")
+        val content: mut str.StringView = mark.content
+        if str.starts_with(content, "[ ] ") {
+            util.abuf_append(ctx.ar, b, "<input type=\"checkbox\" disabled> ")
+            content = str.slice(content, 4, content.len)
+        } elif str.starts_with(content, "[x] ") || str.starts_with(content, "[X] ") {
+            util.abuf_append(ctx.ar, b, "<input type=\"checkbox\" checked disabled> ")
+            content = str.slice(content, 4, content.len)
+        }
+        render_inline(ctx, b, content)
+        i++
+        for {
+            if i >= end {
+                break
+            }
+            val cont: str.StringView = at(lines, i)
+            if is_blank(cont) {
+                break
+            }
+            val ci: i64 = indent_of(cont)
+            if ci <= base_indent {
+                break
+            }
+            if has_list_mark(cont) {
+                util.abuf_append(ctx.ar, b, "\n")
+                i = render_list(ctx, b, lines, i, end)
+                continue
+            }
+            util.abuf_append(ctx.ar, b, " ")
+            render_inline(ctx, b, str.trim(cont))
+            i++
+        }
+        util.abuf_append(ctx.ar, b, "</li>\n")
+        if i < end {
+            val nxt: str.StringView = at(lines, i)
+            if is_blank(nxt) {
+                val after: mut i64 = i + 1
+                for {
+                    if after >= end {
+                        break
+                    }
+                    if !is_blank(at(lines, after)) {
+                        break
+                    }
+                    after++
+                }
+                if after < end && indent_of(at(lines, after)) == base_indent &&
+                list_mark(at(lines, after)).ordered == ordered &&
+                list_mark(at(lines, after)).content.len > 0 {
+                    i = after
+                    continue
+                }
+            } elif indent_of(nxt) == base_indent && list_mark(nxt).ordered == ordered &&
+            list_mark(nxt).content.len > 0 {
+                continue
+            }
+        }
+        break
+    }
+    if ordered {
+        util.abuf_append(ctx.ar, b, "</ol>\n")
+    } else {
+        util.abuf_append(ctx.ar, b, "</ul>\n")
+    }
+    return i
+}
+
+fn render_html(
+    ctx: ref MdCtx,
+    b: mut ref util.ABuf,
+    lines: list[str.StringView],
+    start: i64,
+    end: i64
+) i64 = trust {
+    val i: mut i64 = start
+    for {
+        if i >= end {
+            break
+        }
+        val line: str.StringView = at(lines, i)
+        if is_blank(line) {
+            break
+        }
+        util.abuf_append(ctx.ar, b, line)
+        util.abuf_append_char(ctx.ar, b, 10)
+        i++
+    }
+    return i
+}
+
+fn blocks(
+    ctx: mut ref MdCtx,
+    b: mut ref util.ABuf,
+    lines: list[str.StringView],
+    start: i64,
+    end: i64
+) void = trust {
+    val i: mut i64 = start
+    for {
+        if i >= end {
+            break
+        }
+        val line: str.StringView = at(lines, i)
+        if is_blank(line) {
+            i++
+            continue
+        }
+        if is_fence(line) {
+            i = render_code_block(ctx, b, lines, i, end)
+            continue
+        }
+        if heading_level(line) > 0 {
+            render_heading(ctx, b, line)
+            i++
+            continue
+        }
+        if is_hr(line) {
+            util.abuf_append(ctx.ar, b, "<hr>\n")
+            i++
+            continue
+        }
+        if is_quote(line) {
+            i = render_quote(ctx, b, lines, i, end)
+            continue
+        }
+        if has_table_start(lines, i, end) {
+            i = render_table(ctx, b, lines, i, end)
+            continue
+        }
+        if has_list_mark(line) {
+            i = render_list(ctx, b, lines, i, end)
+            continue
+        }
+        if indent_of(line) >= 4 {
+            i = render_indented_code(ctx, b, lines, i, end)
+            continue
+        }
+        if is_html_block(line) {
+            i = render_html(ctx, b, lines, i, end)
+            continue
+        }
+        i = render_paragraph(ctx, b, lines, i, end)
+    }
+}
+
+/// Convert markdown to plain text for the client-side search index.
+pub fn plain_text(
+    ar: allocators.ScopedArenaAllocator,
+    body: str.StringView
+) str.StringView = trust {
+    val out: mut util.ABuf = util.abuf_new(ar)
+    val i: mut i64 = 0
+    val in_fence: mut bool = false
+    val line_start: mut bool = true
+    val last_space: mut bool = false
+    for {
+        if i >= body.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(body.ptr, i))
+        if line_start {
+            val fence_here: bool = (c == 96 || c == 126) && i + 2 < body.len &&
+            @load8(@ptradd(body.ptr, i + 1)) == c &&
+            @load8(@ptradd(body.ptr, i + 2)) == c
+            if fence_here {
+                in_fence = !in_fence
+                for {
+                    if i >= body.len {
+                        break
+                    }
+                    if @load8(@ptradd(body.ptr, i)) == 10 {
+                        break
+                    }
+                    i++
+                }
+                line_start = true
+                last_space = true
+                if i < body.len {
+                    i++
+                }
+                continue
+            }
+            line_start = false
+        }
+        if in_fence {
+            if c == 10 {
+                line_start = true
+            }
+            i++
+            continue
+        }
+        val keep: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+        (c >= 48 && c <= 57) || c == 45 || c == 46 || c == 47 || c == 58
+        if keep {
+            util.abuf_append_char(ar, @addr(out), c)
+            last_space = false
+        } elif !last_space {
+            util.abuf_append_char(ar, @addr(out), 32)
+            last_space = true
+        }
+        if c == 10 {
+            line_start = true
+        }
+        i++
+    }
+    return util.abuf_view(@addr(out))
+}
+
+pub fn render(
+    ar: allocators.ScopedArenaAllocator,
+    la: allocators.ListArena,
+    body: str.StringView,
+    rel: str.StringView
+) result[RenderResult, allocators.AllocError] = trust {
+    val lines: mut list[str.StringView] = @zeroed
+    match split_lines(la, body) {
+        some l => {
+            lines = l
+        }
+        none => {
+            return err allocators.AllocError.OutOfMemory
+        }
+    }
+    val b: mut util.ABuf = util.abuf_new(ar)
+    val toc: mut util.ABuf = util.abuf_new(ar)
+    val slugs: mut list[str.StringView] = @zeroed
+    match @listalloc[allocators.ListArena, str.StringView](la) {
+        ok l => {
+            slugs = l
+        }
+        err e => {
+            return err e
+        }
+    }
+    val ctx: mut MdCtx = @zeroed
+    ctx.ar = ar
+    ctx.la = la
+    ctx.base_dir = util.view_dir(rel)
+    ctx.toc = @addr(toc)
+    ctx.slugs = slugs
+    blocks(@addr(ctx), @addr(b), lines, 0, count(lines))
+    return ok RenderResult{html: util.abuf_view(@addr(b)), toc: util.abuf_view(@addr(toc))}
+}
