@@ -17,7 +17,10 @@
     var button = document.getElementById("theme-toggle");
     if (button) {
       button.setAttribute("aria-pressed", theme === "dark" ? "true" : "false");
-      button.setAttribute("title", theme === "dark" ? "Switch to light mode" : "Switch to dark mode");
+      button.setAttribute(
+        "title",
+        theme === "dark" ? "Switch to light mode" : "Switch to dark mode",
+      );
     }
   }
 
@@ -66,21 +69,28 @@
     });
   });
 
-  var tocLinks = Array.prototype.slice.call(document.querySelectorAll(".toc-link"));
+  var tocLinks = Array.prototype.slice.call(
+    document.querySelectorAll(".toc-link"),
+  );
   if (tocLinks.length && "IntersectionObserver" in window) {
     var byId = {};
     tocLinks.forEach(function (link) {
       var id = decodeURIComponent(link.getAttribute("href").slice(1));
       byId[id] = link;
     });
-    var observer = new IntersectionObserver(function (entries) {
-      entries.forEach(function (entry) {
-        if (!entry.isIntersecting) return;
-        tocLinks.forEach(function (link) { link.classList.remove("active"); });
-        var active = byId[entry.target.id];
-        if (active) active.classList.add("active");
-      });
-    }, { rootMargin: "-72px 0px -70% 0px", threshold: 0 });
+    var observer = new IntersectionObserver(
+      function (entries) {
+        entries.forEach(function (entry) {
+          if (!entry.isIntersecting) return;
+          tocLinks.forEach(function (link) {
+            link.classList.remove("active");
+          });
+          var active = byId[entry.target.id];
+          if (active) active.classList.add("active");
+        });
+      },
+      { rootMargin: "-72px 0px -70% 0px", threshold: 0 },
+    );
     Object.keys(byId).forEach(function (id) {
       var heading = document.getElementById(id);
       if (heading) observer.observe(heading);
@@ -105,7 +115,9 @@
     if (index || loading) return;
     loading = true;
     fetch("/assets/search.json", { cache: "no-store" })
-      .then(function (response) { return response.json(); })
+      .then(function (response) {
+        return response.json();
+      })
       .then(function (data) {
         index = Array.isArray(data) ? data : [];
         loading = false;
@@ -144,7 +156,7 @@
     }
     if (!index) {
       loadIndex();
-      results.innerHTML = "<div class=\"search-empty\">Loading index…</div>";
+      results.innerHTML = '<div class="search-empty">Loading index…</div>';
       results.classList.add("open");
       return;
     }
@@ -154,9 +166,14 @@
       var score = scoreEntry(index[i], terms);
       if (score > 0) scored.push({ score: score, entry: index[i] });
     }
-    scored.sort(function (a, b) { return b.score - a.score; });
+    scored.sort(function (a, b) {
+      return b.score - a.score;
+    });
     if (!scored.length) {
-      results.innerHTML = "<div class=\"search-empty\">No results for “" + escapeHtml(query) + "”</div>";
+      results.innerHTML =
+        '<div class="search-empty">No results for “' +
+        escapeHtml(query) +
+        "”</div>";
       results.classList.add("open");
       activeResult = -1;
       return;
@@ -164,9 +181,16 @@
     var html = "";
     for (var j = 0; j < Math.min(scored.length, 12); j++) {
       var entry = scored[j].entry;
-      html += "<a class=\"search-result\" href=\"" + escapeHtml(entry.url) + "\">" +
-        "<span class=\"search-result-title\">" + escapeHtml(entry.title) + "</span>" +
-        "<span class=\"search-result-context\">" + escapeHtml(entry.context || "") + "</span>" +
+      html +=
+        '<a class="search-result" href="' +
+        escapeHtml(entry.url) +
+        '">' +
+        '<span class="search-result-title">' +
+        escapeHtml(entry.title) +
+        "</span>" +
+        '<span class="search-result-context">' +
+        escapeHtml(entry.context || "") +
+        "</span>" +
         "</a>";
     }
     results.innerHTML = html;
@@ -200,7 +224,8 @@
       Array.prototype.forEach.call(items, function (item, i) {
         item.classList.toggle("active", i === activeResult);
       });
-      if (items[activeResult]) items[activeResult].scrollIntoView({ block: "nearest" });
+      if (items[activeResult])
+        items[activeResult].scrollIntoView({ block: "nearest" });
     });
     document.addEventListener("click", function (event) {
       var wrap = document.querySelector(".search-wrap");
@@ -214,7 +239,9 @@
     var version = String(window.SHELVEZ_VERSION || "");
     setInterval(function () {
       fetch("/__shelvez/version", { cache: "no-store" })
-        .then(function (response) { return response.text(); })
+        .then(function (response) {
+          return response.text();
+        })
         .then(function (next) {
           if (String(next).trim() !== version) window.location.reload();
         })
